@@ -11,11 +11,20 @@ local CONFIG = {
   horizontalOutputSide = "left",
   verticalOutputSide = "right",
 
+  -- Redstone Relay sides that touch the two gearshifts. These sides are
+  -- relative to the relay itself, not the computer.
+  horizontalGearshiftSide = "left",
+  verticalGearshiftSide = "right",
+
+  -- A Create gearshift reverses its output while redstone-powered. Flip one
+  -- of these if that axis initially corrects away from the saved heading.
+  horizontalReverseOnPositiveError = true,
+  verticalReverseOnPositiveError = true,
+
   -- A proportional controller: errors at or above this angle use full speed.
   -- Increase it for gentler correction; decrease it for more aggressive hold.
   fullSpeedAtDegrees = 12,
   deadzoneDegrees = 0.35,
-  updateSeconds = 0.05,
   showDebug = true,
 }
 
@@ -37,17 +46,28 @@ local function resistorLevel(errorRadians)
   return 15 - math.floor(fraction * 15 + 0.5)
 end
 
-local function writeAxis(side, errorRadians)
+local function writeAxis(relay, resistorSide, gearshiftSide, errorRadians,
+    reverseOnPositive)
   -- The Redstone Resistor receives the analogue speed value. The linked
-  -- gearshift assembly is responsible for applying the sign of this error
-  -- (left/right or up/down) to the mechanical rotation path.
-  redstone.setAnalogOutput(side, resistorLevel(errorRadians))
-  return errorRadians
+  -- gearshift is separately powered through the Redstone Relay to choose the
+  -- correction direction.
+  local inDeadzone = math.abs(errorRadians) <= math.rad(CONFIG.deadzoneDegrees)
+  local reversed = errorRadians > 0
+  if not reverseOnPositive then reversed = not reversed end
+  if inDeadzone then reversed = false end
+
+  redstone.setAnalogOutput(resistorSide, resistorLevel(errorRadians))
+  relay.setOutput(gearshiftSide, reversed)
+  return errorRadians, reversed
 end
 
-local function stop()
+local function stop(relay)
   redstone.setAnalogOutput(CONFIG.horizontalOutputSide, 15)
   redstone.setAnalogOutput(CONFIG.verticalOutputSide, 15)
+  if relay then
+    relay.setOutput(CONFIG.horizontalGearshiftSide, false)
+    relay.setOutput(CONFIG.verticalGearshiftSide, false)
+  end
 end
 
 -- CC:VS versions serialise ship quaternions differently. Newer versions may
@@ -117,7 +137,8 @@ local function getYawPitchError(target)
   return yaw, pitch, current
 end
 
-local function draw(target, yaw, pitch, horizontal, vertical)
+local function draw(target, yaw, pitch, horizontal, vertical, horizontalReverse,
+    verticalReverse)
   if not CONFIG.showDebug then return end
   term.clear()
   term.setCursorPos(1, 1)
@@ -127,29 +148,43 @@ local function draw(target, yaw, pitch, horizontal, vertical)
   print(("Pitch error: %7.2f deg"):format(radiansToDegrees(pitch)))
   print("Horiz resistor: " .. resistorLevel(horizontal) .. "/15")
   print("Vert  resistor: " .. resistorLevel(vertical) .. "/15")
+  print("Horiz gearshift: " .. (horizontalReverse and "reverse" or "normal"))
+  print("Vert  gearshift: " .. (verticalReverse and "reverse" or "normal"))
   print("Ctrl+T = stop")
 end
 
 local function run()
   assert(type(ship) == "table" and type(ship.getQuaternion) == "function",
     "CC:VS ship API was not found. Put this computer on the turret ship.")
+  local relay = peripheral.find("redstone_relay")
+  assert(relay, "No redstone_relay found on the wired-modem network.")
 
   local target = asQuaternion(ship.getQuaternion())
   while true do
     local yaw, pitch = getYawPitchError(target)
-    local horizontal = writeAxis(CONFIG.horizontalOutputSide, yaw)
-    local vertical = writeAxis(CONFIG.verticalOutputSide, pitch)
-    draw(target, yaw, pitch, horizontal, vertical)
-    sleep(CONFIG.updateSeconds)
+    local horizontal, horizontalReverse = writeAxis(relay,
+      CONFIG.horizontalOutputSide, CONFIG.horizontalGearshiftSide, yaw,
+      CONFIG.horizontalReverseOnPositiveError)
+    local vertical, verticalReverse = writeAxis(relay,
+      CONFIG.verticalOutputSide, CONFIG.verticalGearshiftSide, pitch,
+      CONFIG.verticalReverseOnPositiveError)
+    draw(target, yaw, pitch, horizontal, vertical, horizontalReverse,
+      verticalReverse)
+    -- CC:Tweaked's sleep yields execution. 0.05 seconds is one Minecraft
+    -- tick at 20 TPS, so this samples and corrects once per game tick.
+    sleep(0.05)
   end
 end
 
 local ok, message = xpcall(run, function(errorObject)
+  if tostring(errorObject) == "Terminated" then return "__terminated__" end
   return tostring(errorObject) .. "\n" .. debug.traceback()
 end)
 
-stop()
-if not ok then
+-- The relay is discovered inside run(), so locate it again for a safe stop
+-- after either Ctrl+T or a runtime error.
+stop(peripheral.find("redstone_relay"))
+if not ok and message ~= "__terminated__" then
   term.clear()
   term.setCursorPos(1, 1)
   print("Turret stabilizer stopped:")
