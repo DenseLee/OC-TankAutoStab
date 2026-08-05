@@ -24,7 +24,20 @@ local CONFIG = {
   -- A proportional controller: errors at or above this angle use full speed.
   -- Increase it for gentler correction; decrease it for more aggressive hold.
   fullSpeedAtDegrees = 12,
-  deadzoneDegrees = 0.35,
+  deadzoneDegrees = 0.8,
+
+  -- PD tuning. Keep proportionalGain at 1.0 to preserve the original speed
+  -- response. The derivative term slows an axis already moving toward its
+  -- target and boosts it slightly when moving farther away. Do not add an
+  -- integral term: it would wind up while the gearshift is changing state.
+  proportionalGain = 1.0,
+  derivativeGainSeconds = 0.20,
+
+  -- Safety cap for the Clockwork Redstone Resistors. The program will never
+  -- send a value lower than this, so it never releases the full input RPM.
+  -- Start at 10 (roughly a gentle third-speed cap) and only lower it after
+  -- confirming the kinetic network is stable and below Create's speed limit.
+  minimumResistorLevel = 10,
   showDebug = true,
 }
 
@@ -43,22 +56,23 @@ local function resistorLevel(errorRadians)
 
   local fraction = clamp(math.abs(errorRadians) /
     math.rad(CONFIG.fullSpeedAtDegrees), 0, 1)
-  return 15 - math.floor(fraction * 15 + 0.5)
+  local requestedLevel = 15 - math.floor(fraction * 15 + 0.5)
+  return math.max(CONFIG.minimumResistorLevel, requestedLevel)
 end
 
-local function writeAxis(relay, resistorSide, gearshiftSide, errorRadians,
-    reverseOnPositive)
+local function writeAxis(relay, resistorSide, gearshiftSide, directionError,
+    speedCommand, reverseOnPositive)
   -- The Redstone Resistor receives the analogue speed value. The linked
   -- gearshift is separately powered through the Redstone Relay to choose the
   -- correction direction.
-  local inDeadzone = math.abs(errorRadians) <= math.rad(CONFIG.deadzoneDegrees)
-  local reversed = errorRadians > 0
+  local inDeadzone = math.abs(directionError) <= math.rad(CONFIG.deadzoneDegrees)
+  local reversed = directionError > 0
   if not reverseOnPositive then reversed = not reversed end
   if inDeadzone then reversed = false end
 
-  redstone.setAnalogOutput(resistorSide, resistorLevel(errorRadians))
+  redstone.setAnalogOutput(resistorSide, resistorLevel(speedCommand))
   relay.setOutput(gearshiftSide, reversed)
-  return errorRadians, reversed
+  return speedCommand, reversed
 end
 
 local function stop(relay)
@@ -137,6 +151,18 @@ local function getYawPitchError(target)
   return yaw, pitch, current
 end
 
+local function pdCommand(errorRadians, previousError)
+  if math.abs(errorRadians) <= math.rad(CONFIG.deadzoneDegrees) then return 0 end
+  if previousError == nil then return CONFIG.proportionalGain * math.abs(errorRadians) end
+
+  local derivative = (errorRadians - previousError) / 0.05
+  -- Convert the derivative to the direction of the current error. A negative
+  -- result means the turret is already closing the error, so reduce speed.
+  local directionalDerivative = (errorRadians < 0 and -1 or 1) * derivative
+  return math.max(0, CONFIG.proportionalGain * math.abs(errorRadians)
+    + CONFIG.derivativeGainSeconds * directionalDerivative)
+end
+
 local function draw(target, yaw, pitch, horizontal, vertical, horizontalReverse,
     verticalReverse)
   if not CONFIG.showDebug then return end
@@ -160,16 +186,22 @@ local function run()
   assert(relay, "No redstone_relay found on the wired-modem network.")
 
   local target = asQuaternion(ship.getQuaternion())
+  local previousYaw, previousPitch = nil, nil
   while true do
     local yaw, pitch = getYawPitchError(target)
+    local horizontalCommand = pdCommand(yaw, previousYaw)
+    local verticalCommand = pdCommand(pitch, previousPitch)
     local horizontal, horizontalReverse = writeAxis(relay,
       CONFIG.horizontalOutputSide, CONFIG.horizontalGearshiftSide, yaw,
+      horizontalCommand,
       CONFIG.horizontalReverseOnPositiveError)
     local vertical, verticalReverse = writeAxis(relay,
       CONFIG.verticalOutputSide, CONFIG.verticalGearshiftSide, pitch,
+      verticalCommand,
       CONFIG.verticalReverseOnPositiveError)
     draw(target, yaw, pitch, horizontal, vertical, horizontalReverse,
       verticalReverse)
+    previousYaw, previousPitch = yaw, pitch
     -- CC:Tweaked's sleep yields execution. 0.05 seconds is one Minecraft
     -- tick at 20 TPS, so this samples and corrects once per game tick.
     sleep(0.05)
