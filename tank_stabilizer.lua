@@ -33,6 +33,11 @@ local CONFIG = {
   proportionalGain = 1.0,
   derivativeGainSeconds = 0.20,
 
+  -- Minimum number of control ticks between analogue resistor changes.
+  -- The main loop still runs every 0.05 s; this only prevents rapid redstone
+  -- level churn on the Redstone Resistors. 3 ticks = 0.15 seconds.
+  resistorCooldownTicks = 3,
+
   -- Safety cap for the Clockwork Redstone Resistors. The program will never
   -- send a value lower than this, so it never releases the full input RPM.
   -- Start at 10 (roughly a gentle third-speed cap) and only lower it after
@@ -60,8 +65,22 @@ local function resistorLevel(errorRadians)
   return math.max(CONFIG.minimumResistorLevel, requestedLevel)
 end
 
-local function writeAxis(relay, resistorSide, gearshiftSide, directionError,
-    speedCommand, reverseOnPositive)
+local function setResistor(state, side, desiredLevel)
+  if state.cooldown > 0 then
+    state.cooldown = state.cooldown - 1
+    return state.level
+  end
+
+  if state.level ~= desiredLevel then
+    redstone.setAnalogOutput(side, desiredLevel)
+    state.level = desiredLevel
+    state.cooldown = CONFIG.resistorCooldownTicks
+  end
+  return state.level
+end
+
+local function writeAxis(relay, resistorState, resistorSide, gearshiftSide,
+    directionError, speedCommand, reverseOnPositive)
   -- The Redstone Resistor receives the analogue speed value. The linked
   -- gearshift is separately powered through the Redstone Relay to choose the
   -- correction direction.
@@ -70,9 +89,10 @@ local function writeAxis(relay, resistorSide, gearshiftSide, directionError,
   if not reverseOnPositive then reversed = not reversed end
   if inDeadzone then reversed = false end
 
-  redstone.setAnalogOutput(resistorSide, resistorLevel(speedCommand))
+  local appliedLevel = setResistor(resistorState, resistorSide,
+    resistorLevel(speedCommand))
   relay.setOutput(gearshiftSide, reversed)
-  return speedCommand, reversed
+  return appliedLevel, reversed
 end
 
 local function stop(relay)
@@ -163,7 +183,7 @@ local function pdCommand(errorRadians, previousError)
     + CONFIG.derivativeGainSeconds * directionalDerivative)
 end
 
-local function draw(target, yaw, pitch, horizontal, vertical, horizontalReverse,
+local function draw(target, yaw, pitch, horizontalLevel, verticalLevel, horizontalReverse,
     verticalReverse)
   if not CONFIG.showDebug then return end
   term.clear()
@@ -172,8 +192,8 @@ local function draw(target, yaw, pitch, horizontal, vertical, horizontalReverse,
   print("Target captured on boot")
   print(("Yaw error  : %7.2f deg"):format(radiansToDegrees(yaw)))
   print(("Pitch error: %7.2f deg"):format(radiansToDegrees(pitch)))
-  print("Horiz resistor: " .. resistorLevel(horizontal) .. "/15")
-  print("Vert  resistor: " .. resistorLevel(vertical) .. "/15")
+  print("Horiz resistor: " .. horizontalLevel .. "/15")
+  print("Vert  resistor: " .. verticalLevel .. "/15")
   print("Horiz gearshift: " .. (horizontalReverse and "reverse" or "normal"))
   print("Vert  gearshift: " .. (verticalReverse and "reverse" or "normal"))
   print("Ctrl+T = stop")
@@ -187,19 +207,23 @@ local function run()
 
   local target = asQuaternion(ship.getQuaternion())
   local previousYaw, previousPitch = nil, nil
+  local horizontalResistor = { level = nil, cooldown = 0 }
+  local verticalResistor = { level = nil, cooldown = 0 }
   while true do
     local yaw, pitch = getYawPitchError(target)
     local horizontalCommand = pdCommand(yaw, previousYaw)
     local verticalCommand = pdCommand(pitch, previousPitch)
-    local horizontal, horizontalReverse = writeAxis(relay,
+    local horizontalLevel, horizontalReverse = writeAxis(relay,
+      horizontalResistor,
       CONFIG.horizontalOutputSide, CONFIG.horizontalGearshiftSide, yaw,
       horizontalCommand,
       CONFIG.horizontalReverseOnPositiveError)
-    local vertical, verticalReverse = writeAxis(relay,
+    local verticalLevel, verticalReverse = writeAxis(relay,
+      verticalResistor,
       CONFIG.verticalOutputSide, CONFIG.verticalGearshiftSide, pitch,
       verticalCommand,
       CONFIG.verticalReverseOnPositiveError)
-    draw(target, yaw, pitch, horizontal, vertical, horizontalReverse,
+    draw(target, yaw, pitch, horizontalLevel, verticalLevel, horizontalReverse,
       verticalReverse)
     previousYaw, previousPitch = yaw, pitch
     -- CC:Tweaked's sleep yields execution. 0.05 seconds is one Minecraft
