@@ -1,4 +1,4 @@
-a-- World-space turret hold for CC:VS + VS: Clockwork.
+-- World-space turret hold for CC:VS + VS: Clockwork.
 --
 -- Put this computer ON THE SEPARATE TURRET SHIP. On boot it records that
 -- ship's quaternion, then tries to keep the turret at that exact world-space
