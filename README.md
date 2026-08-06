@@ -1,7 +1,6 @@
-[README.md](https://github.com/user-attachments/files/30756372/README.md)
-# OC-TankAutoStab# CC:Tweaked Tank Tussle stabilizer
+# CC:Tweaked Tank Tussle stabilizer
 
-`tank_stabilizer.lua` is a standalone ComputerCraft program for a computer on a Create/Clockwork tank.
+`tank_stabilizer.lua` is a world-space turret stabilizer for a ComputerCraft computer mounted on a separate VS: Clockwork turret ship.
 
 ## Wiring assumed by the default configuration
 
@@ -14,7 +13,12 @@
         left gearshift        right gearshift
 ```
 
-The program writes analog redstone levels to the computer's `left` and `right` sides. The front modem is optional if the lectern is directly connected; otherwise it lets CC:Tweaked discover the lectern over the peripheral network. The lectern must appear as the `tweaked_controller` peripheral.
+The program captures the turret ship's current CC:VS quaternion on startup and holds that world-space direction. It uses four control paths:
+
+- computer left → horizontal Redstone Resistor (analog speed)
+- computer right → vertical Redstone Resistor (analog speed)
+- front-network Redstone Relay left → horizontal gearshift (binary direction)
+- front-network Redstone Relay right → vertical gearshift (binary direction)
 
 Install and run:
 
@@ -25,35 +29,59 @@ tank_stabilizer
 
 Or copy the file directly to the computer as `tank_stabilizer`.
 
-## Controller behavior
+## Stabilizer behavior
 
-The default `differential` mode uses the left stick:
+On startup, the program stores the turret's current world orientation. When the tank hull rotates, the turret's current quaternion changes and the program drives it back to the stored orientation.
 
-- left stick Y: forward/reverse throttle
-- left stick X: steering
-- output: left = throttle + steering; right = throttle - steering
+- left output: horizontal correction
+- right output: vertical correction
+- Redstone Resistor speed mapping: `0` = full speed; `15` = stopped
 
-The output is a magnitude from 0 to 15. The mechanical Create/Clockwork arrangement must provide the desired direction and gearing; the script does not reverse a gearshift by itself.
+The program drives the Redstone Relay's left/right sides to reverse the corresponding Create gearshift when the yaw/pitch error changes sign. It starts with both resistors at `15` and both gearshifts unpowered whenever the turret is at the target angle or the program stops.
 
-For a one-axis stabilizer pair, change:
+The control loop runs once per game tick with `sleep(0.05)`.
 
-```lua
-mode = "single_axis"
-```
+The current tuning uses `fullSpeedAtDegrees = 45`, a `0.2` degree deadzone, proportional gain `1`, and derivative gain `0.0005`. There is deliberately no reversal delay or integral term.
 
-That mode reads the right-stick X axis and drives only one side at a time: positive correction drives the left output, negative correction drives the right output.
+Each resistor uses a one-tick (`0.05` second) output cooldown by default. Direction signals remain immediate.
+
+## Player-controlled target
+
+Place a Tweaked Controller on the lectern behind the computer. CC:Tweaked exposes it as a `tweaked_controller` peripheral; the program finds it automatically, including through the wired-modem network. While a player is using the lectern, the right stick adjusts the saved target:
+
+- right-stick X (axis 3): horizontal target aim
+- right-stick Y (axis 4): vertical target aim
+
+When the player releases the lectern or centers the stick, the turret holds the new world-space target. `aimDegreesPerSecond` controls manual turn speed; toggle `invertHorizontalAim` or `invertVerticalAim` if either input feels reversed.
+
+## Fault-isolation stress test
+
+`stability_stress_test.lua` helps identify why a resistor breaks. It tests one axis at a time and always stops both resistors/unpowers both gearshifts on exit.
+
+Start with `mode = "resistor"`: it changes only the resistor's analogue signal while its gearshift stays in one direction. If that breaks the resistor, redstone-level churn or fractional RPM is sufficient to cause the fault.
+
+Then use `mode = "gearshift"`: it holds the resistor at a fixed speed while reversing only the gearshift. If that breaks the resistor, reversing under transmitted rotation is the cause.
+
+Finally use `mode = "both"` only if neither isolated test breaks it. It recreates simultaneous speed and direction changes. Begin with the default five-second duration and change `CHANGE_EVERY_TICKS` to a larger number for a less aggressive test.
 
 ## Tuning
 
 Edit the `CONFIG` table at the top of the program:
 
-- swap `leftOutputSide` and `rightOutputSide` if the tank steers backward;
-- change `invertThrottle`, `invertSteering`, or `invertStabilizer` if an axis is reversed;
+- swap `horizontalOutputSide` and `verticalOutputSide` only if the physical axis wiring is reversed;
+- if an axis initially drives farther from its stored direction, toggle that axis's `...ReverseOnPositiveError` setting;
+- increase `fullSpeedAtDegrees` for a gentler correction, or decrease it for a faster correction;
+- `minimumRedstoneResistorLevel` caps maximum transmission. The current value is `0`, as tuned for your setup.
 - increase `deadzone` if the controller drifts at center;
 - set `showDebug = false` once the setup works.
 
-The Tweaked Lectern Controller peripheral API provides `hasUser()`, `getAxis(1..6)`, and `getButton(1..15)`. This program uses `getAxis` and automatically shuts both outputs off when no player is using the controller.
+## Controller cable input test
 
-## Important limitation
+`controller_input_test.lua` is a safe diagnostic for a remote controller setup. It drives nothing: it only displays the four analogue redstone inputs every `0.05` seconds.
 
-True turret auto-stabilization requires a heading/rotation sensor or a second feedback signal. A controller alone can provide a correction command, but it cannot know how much the tank hull has rotated. The included `single_axis` mode is therefore an open-loop two-gearshift stabilizer/control pair, not a closed-loop gyro stabilizer.
+- computer top: horizontal `+X`
+- computer back: horizontal `-X`
+- Redstone Relay top: elevation `+Y`
+- Redstone Relay bottom: elevation `-Y`
+
+It is intended for separate positive/negative Drive-By-Wire-to-redstone outputs. Run this test before connecting those inputs to the stabilizer's manual-aim controls.

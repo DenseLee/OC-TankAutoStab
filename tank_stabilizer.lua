@@ -23,26 +23,36 @@ local CONFIG = {
 
   -- A proportional controller: errors at or above this angle use full speed.
   -- Increase it for gentler correction; decrease it for more aggressive hold.
-  fullSpeedAtDegrees = 12,
-  deadzoneDegrees = 0.8,
+  fullSpeedAtDegrees = 45,
+  deadzoneDegrees = 0.2,
 
   -- PD tuning. Keep proportionalGain at 1.0 to preserve the original speed
   -- response. The derivative term slows an axis already moving toward its
   -- target and boosts it slightly when moving farther away. Do not add an
   -- integral term: it would wind up while the gearshift is changing state.
-  proportionalGain = 1.0,
-  derivativeGainSeconds = 0.20,
+  proportionalGain = 1,
+  derivativeGainSeconds = 0.0005,
 
   -- Minimum number of control ticks between analogue resistor changes.
   -- The main loop still runs every 0.05 s; this only prevents rapid redstone
   -- level churn on the Redstone Resistors. 3 ticks = 0.15 seconds.
-  resistorCooldownTicks = 3,
+  resistorCooldownTicks = 1,
 
   -- Safety cap for the Clockwork Redstone Resistors. The program will never
   -- send a value lower than this, so it never releases the full input RPM.
   -- Start at 10 (roughly a gentle third-speed cap) and only lower it after
   -- confirming the kinetic network is stable and below Create's speed limit.
-  minimumResistorLevel = 10,
+  minimumRedstoneResistorLevel = 0,
+
+  -- Tweaked Lectern Controller aiming. Axis 3/4 are the right-stick X/Y
+  -- inputs. While a player is using the lectern, these change the saved
+  -- world-space target. Releasing the controller holds the new target.
+  horizontalAimAxis = 3,
+  verticalAimAxis = 4,
+  aimDegreesPerSecond = 90,
+  aimDeadzone = 0.08,
+  invertHorizontalAim = false,
+  invertVerticalAim = true,
   showDebug = true,
 }
 
@@ -62,7 +72,7 @@ local function resistorLevel(errorRadians)
   local fraction = clamp(math.abs(errorRadians) /
     math.rad(CONFIG.fullSpeedAtDegrees), 0, 1)
   local requestedLevel = 15 - math.floor(fraction * 15 + 0.5)
-  return math.max(CONFIG.minimumResistorLevel, requestedLevel)
+  return math.max(CONFIG.minimumRedstoneResistorLevel, requestedLevel)
 end
 
 local function setResistor(state, side, desiredLevel)
@@ -136,6 +146,12 @@ local function normalize(q)
   return { x = q.x / length, y = q.y / length, z = q.z / length, w = q.w / length }
 end
 
+local function fromAxisAngle(x, y, z, angle)
+  local halfAngle = angle / 2
+  local sine = math.sin(halfAngle)
+  return { x = x * sine, y = y * sine, z = z * sine, w = math.cos(halfAngle) }
+end
+
 local function inverse(q)
   local lengthSquared = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w
   assert(lengthSquared > 0, "Invalid zero-length quaternion")
@@ -183,13 +199,56 @@ local function pdCommand(errorRadians, previousError)
     + CONFIG.derivativeGainSeconds * directionalDerivative)
 end
 
+local function findController()
+  local controller = peripheral.find("tweaked_controller")
+  if controller then return controller end
+
+  for _, name in ipairs(peripheral.getNames()) do
+    local candidate = peripheral.wrap(name)
+    if candidate and type(candidate.hasUser) == "function"
+        and type(candidate.getAxis) == "function" then
+      return candidate
+    end
+  end
+end
+
+local function controllerAxis(controller, axis, inverted)
+  local value = controller.getAxis(axis)
+  if type(value) ~= "number" then return 0 end
+  value = clamp(value, -1, 1)
+  if inverted then value = -value end
+  if math.abs(value) <= CONFIG.aimDeadzone then return 0 end
+
+  local sign = value < 0 and -1 or 1
+  return sign * (math.abs(value) - CONFIG.aimDeadzone) / (1 - CONFIG.aimDeadzone)
+end
+
+local function updateTargetFromController(target, controller)
+  if not controller or not controller.hasUser() then return target, false end
+
+  local horizontal = controllerAxis(controller, CONFIG.horizontalAimAxis,
+    CONFIG.invertHorizontalAim)
+  local vertical = controllerAxis(controller, CONFIG.verticalAimAxis,
+    CONFIG.invertVerticalAim)
+  if horizontal == 0 and vertical == 0 then return target, true end
+
+  local degreesPerTick = CONFIG.aimDegreesPerSecond * 0.05
+  -- Yaw is world-space (global Y). Pitch is target-local X so elevation stays
+  -- intuitive after the turret has been traversed.
+  local yawAdjustment = fromAxisAngle(0, 1, 0,
+    math.rad(horizontal * degreesPerTick))
+  local pitchAdjustment = fromAxisAngle(1, 0, 0,
+    math.rad(vertical * degreesPerTick))
+  return normalize(multiply(yawAdjustment, multiply(target, pitchAdjustment))), true
+end
+
 local function draw(target, yaw, pitch, horizontalLevel, verticalLevel, horizontalReverse,
-    verticalReverse)
+    verticalReverse, playerAiming)
   if not CONFIG.showDebug then return end
   term.clear()
   term.setCursorPos(1, 1)
   print("VS turret world hold")
-  print("Target captured on boot")
+  print("Player aim: " .. (playerAiming and "active" or "holding target"))
   print(("Yaw error  : %7.2f deg"):format(radiansToDegrees(yaw)))
   print(("Pitch error: %7.2f deg"):format(radiansToDegrees(pitch)))
   print("Horiz resistor: " .. horizontalLevel .. "/15")
@@ -204,12 +263,17 @@ local function run()
     "CC:VS ship API was not found. Put this computer on the turret ship.")
   local relay = peripheral.find("redstone_relay")
   assert(relay, "No redstone_relay found on the wired-modem network.")
+  local controller = findController()
+  assert(controller, "No tweaked_controller found. Put the controller on a lectern.")
+  pcall(controller.setFullPrecision, true)
 
   local target = asQuaternion(ship.getQuaternion())
   local previousYaw, previousPitch = nil, nil
   local horizontalResistor = { level = nil, cooldown = 0 }
   local verticalResistor = { level = nil, cooldown = 0 }
   while true do
+    local playerAiming
+    target, playerAiming = updateTargetFromController(target, controller)
     local yaw, pitch = getYawPitchError(target)
     local horizontalCommand = pdCommand(yaw, previousYaw)
     local verticalCommand = pdCommand(pitch, previousPitch)
@@ -224,7 +288,7 @@ local function run()
       verticalCommand,
       CONFIG.verticalReverseOnPositiveError)
     draw(target, yaw, pitch, horizontalLevel, verticalLevel, horizontalReverse,
-      verticalReverse)
+      verticalReverse, playerAiming)
     previousYaw, previousPitch = yaw, pitch
     -- CC:Tweaked's sleep yields execution. 0.05 seconds is one Minecraft
     -- tick at 20 TPS, so this samples and corrects once per game tick.
