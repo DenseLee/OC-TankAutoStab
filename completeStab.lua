@@ -30,7 +30,7 @@ local CONFIG = {
   proportionalGain = 1,
   derivativeGainSeconds = 0.0005,
   resistorCooldownTicks = 1,
-  directionStopTicks = 1,
+  directionSettleTicks = 2,
   minimumRedstoneResistorLevel = 0,
 
   -- Remote controller target movement. 90 means full stick moves the saved
@@ -173,29 +173,27 @@ local function writeAxis(relay, state, resistorSide, gearshiftSide, error,
   if not reverseOnPositive then desiredReverse = not desiredReverse end
   if inDeadzone then desiredReverse = false end
 
-  -- Cancel a not-yet-applied reversal if the error returned to the current
-  -- side while the resistor was stopped.
-  if state.pendingReverse and desiredReverse == state.reverse then
-    state.pendingReverse = nil
-    state.stopTicks = 0
-  end
-
-  if state.pendingReverse then
+  if state.switching then
     forceResistorStop(state, resistorSide)
-    state.stopTicks = state.stopTicks - 1
-    if state.stopTicks <= 0 then
-      -- The output changes only on an actual direction transition. The prior
-      -- tick was guaranteed stopped, so the gearshift never reverses loaded.
-      relay.setOutput(gearshiftSide, state.pendingReverse)
-      state.reverse = state.pendingReverse
-      state.pendingReverse = nil
+    if state.phase == "change" then
+      -- The immediately preceding control tick had the resistor at 15.
+      relay.setOutput(gearshiftSide, state.nextReverse)
+      state.reverse = state.nextReverse
+      state.phase = "settle"
+      state.settleTicks = CONFIG.directionSettleTicks
+    else
+      state.settleTicks = state.settleTicks - 1
+      if state.settleTicks <= 0 then state.switching = false end
     end
     return 15, state.reverse
   end
 
   if desiredReverse ~= state.reverse then
-    state.pendingReverse = desiredReverse
-    state.stopTicks = CONFIG.directionStopTicks
+    -- Step 1: stop transmission now. Step 2 happens next tick; it changes
+    -- the gearshift. Step 3 holds stopped for directionSettleTicks ticks.
+    state.switching = true
+    state.phase = "change"
+    state.nextReverse = desiredReverse
     forceResistorStop(state, resistorSide)
     return 15, state.reverse
   end
@@ -236,8 +234,8 @@ local function run()
 
   local target = asQuaternion(ship.getQuaternion())
   local previousYaw, previousPitch = nil, nil
-  local horizontalState = { level=15, cooldown=0, reverse=false, pendingReverse=nil, stopTicks=0 }
-  local verticalState = { level=15, cooldown=0, reverse=false, pendingReverse=nil, stopTicks=0 }
+  local horizontalState = { level=15, cooldown=0, reverse=false, switching=false }
+  local verticalState = { level=15, cooldown=0, reverse=false, switching=false }
   while true do
     local hAim, vAim, right, left, up, down
     target, hAim, vAim, right, left, up, down = updateTarget(target, relay)
