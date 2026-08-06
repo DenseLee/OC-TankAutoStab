@@ -31,6 +31,7 @@ local CONFIG = {
   derivativeGainSeconds = 0.0005,
   resistorCooldownTicks = 1,
   directionSettleTicks = 2,
+  aimReleaseSettleTicks = 2,
   minimumRedstoneResistorLevel = 0,
 
   -- Remote controller target movement. 90 means full stick moves the saved
@@ -277,29 +278,48 @@ local function run()
   local target = asQuaternion(ship.getQuaternion())
   local previousYaw, previousPitch = nil, nil
   local wasAiming = false
+  local releaseSettleTicks = 0
   local horizontalState = { level=15, cooldown=0, reverse=false, switching=false }
   local verticalState = { level=15, cooldown=0, reverse=false, switching=false }
   while true do
     local hAim, vAim, right, left, up, down, aiming
     target, hAim, vAim, right, left, up, down, aiming = updateTarget(target, relay)
-    if wasAiming and not aiming then
-      -- The target advanced at a fixed command rate while the actual turret
-      -- may have been slower. On release, capture the real turret direction
-      -- so it holds exactly where the player stopped rather than chasing the
-      -- accumulated virtual target (and potentially reversing past it).
+    if aiming and releaseSettleTicks > 0 then
+      -- Player resumed input before the release settle completed.
+      releaseSettleTicks = 0
       target = asQuaternion(ship.getQuaternion())
       previousYaw, previousPitch = nil, nil
     end
-    local yaw, pitch = getYawPitchError(target)
-    local hLevel, hReverse = writeAxis(relay, horizontalState,
-      CONFIG.horizontalOutputSide, CONFIG.horizontalGearshiftSide, yaw,
-      pdCommand(yaw, previousYaw), CONFIG.horizontalReverseOnPositiveError)
-    local vLevel, vReverse = writeAxis(relay, verticalState,
-      CONFIG.verticalOutputSide, CONFIG.verticalGearshiftSide, pitch,
-      pdCommand(pitch, previousPitch), CONFIG.verticalReverseOnPositiveError)
-    draw(yaw, pitch, hLevel, vLevel, hReverse, vReverse,
-      hAim, vAim, right, left, up, down)
-    previousYaw, previousPitch = yaw, pitch
+    if wasAiming and not aiming then
+      -- Stop immediately and let any last mechanical movement settle before
+      -- recording the final held direction.
+      releaseSettleTicks = CONFIG.aimReleaseSettleTicks
+      horizontalState.switching = false
+      verticalState.switching = false
+      previousYaw, previousPitch = nil, nil
+    end
+
+    if releaseSettleTicks > 0 then
+      forceResistorStop(horizontalState, CONFIG.horizontalOutputSide)
+      forceResistorStop(verticalState, CONFIG.verticalOutputSide)
+      releaseSettleTicks = releaseSettleTicks - 1
+      if releaseSettleTicks == 0 then
+        target = asQuaternion(ship.getQuaternion())
+      end
+      draw(0, 0, 15, 15, horizontalState.reverse, verticalState.reverse,
+        hAim, vAim, right, left, up, down)
+    else
+      local yaw, pitch = getYawPitchError(target)
+      local hLevel, hReverse = writeAxis(relay, horizontalState,
+        CONFIG.horizontalOutputSide, CONFIG.horizontalGearshiftSide, yaw,
+        pdCommand(yaw, previousYaw), CONFIG.horizontalReverseOnPositiveError)
+      local vLevel, vReverse = writeAxis(relay, verticalState,
+        CONFIG.verticalOutputSide, CONFIG.verticalGearshiftSide, pitch,
+        pdCommand(pitch, previousPitch), CONFIG.verticalReverseOnPositiveError)
+      draw(yaw, pitch, hLevel, vLevel, hReverse, vReverse,
+        hAim, vAim, right, left, up, down)
+      previousYaw, previousPitch = yaw, pitch
+    end
     wasAiming = aiming
     sleep(TICK_SECONDS)
   end
