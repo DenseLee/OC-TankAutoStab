@@ -35,9 +35,9 @@ local CONFIG = {
 
   -- Remote controller target movement. 90 means full stick moves the saved
   -- aim point by 90 degrees per second.
-  aimDegreesPerSecond = 90,
+  aimDegreesPerSecond = 36,
   aimInputDeadzone = 0.05,
-  invertHorizontalAim = false,
+  invertHorizontalAim = true,
   invertVerticalAim = true,
   showDebug = true,
 }
