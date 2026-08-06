@@ -128,7 +128,8 @@ local function updateTarget(target, relay)
     local pitch = axisAngle(1, 0, 0, vertical * amount)
     target = normalize(multiply(yaw, multiply(target, pitch)))
   end
-  return target, horizontal, vertical, right, left, up, down
+  return target, horizontal, vertical, right, left, up, down,
+    horizontal ~= 0 or vertical ~= 0
 end
 
 local function resistorLevel(command)
@@ -234,11 +235,20 @@ local function run()
 
   local target = asQuaternion(ship.getQuaternion())
   local previousYaw, previousPitch = nil, nil
+  local wasAiming = false
   local horizontalState = { level=15, cooldown=0, reverse=false, switching=false }
   local verticalState = { level=15, cooldown=0, reverse=false, switching=false }
   while true do
-    local hAim, vAim, right, left, up, down
-    target, hAim, vAim, right, left, up, down = updateTarget(target, relay)
+    local hAim, vAim, right, left, up, down, aiming
+    target, hAim, vAim, right, left, up, down, aiming = updateTarget(target, relay)
+    if wasAiming and not aiming then
+      -- The target advanced at a fixed command rate while the actual turret
+      -- may have been slower. On release, capture the real turret direction
+      -- so it holds exactly where the player stopped rather than chasing the
+      -- accumulated virtual target (and potentially reversing past it).
+      target = asQuaternion(ship.getQuaternion())
+      previousYaw, previousPitch = nil, nil
+    end
     local yaw, pitch = getYawPitchError(target)
     local hLevel, hReverse = writeAxis(relay, horizontalState,
       CONFIG.horizontalOutputSide, CONFIG.horizontalGearshiftSide, yaw,
@@ -249,6 +259,7 @@ local function run()
     draw(yaw, pitch, hLevel, vLevel, hReverse, vReverse,
       hAim, vAim, right, left, up, down)
     previousYaw, previousPitch = yaw, pitch
+    wasAiming = aiming
     sleep(TICK_SECONDS)
   end
 end
