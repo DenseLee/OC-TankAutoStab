@@ -30,6 +30,7 @@ local CONFIG = {
   proportionalGain = 1,
   derivativeGainSeconds = 0.0005,
   resistorCooldownTicks = 1,
+  directionStopTicks = 1,
   minimumRedstoneResistorLevel = 0,
 
   -- Remote controller target movement. 90 means full stick moves the saved
@@ -156,15 +157,50 @@ local function setResistor(state, side, level)
   return state.level or 15
 end
 
+local function forceResistorStop(state, side)
+  -- A reversal must never wait for the normal output cooldown. Stop the
+  -- transmitted rotation immediately, then allow the gearshift to change.
+  if state.level ~= 15 then redstone.setAnalogOutput(side, 15) end
+  state.level = 15
+  state.cooldown = CONFIG.resistorCooldownTicks
+  return 15
+end
+
 local function writeAxis(relay, state, resistorSide, gearshiftSide, error,
     command, reverseOnPositive)
   local inDeadzone = math.abs(error) <= math.rad(CONFIG.deadzoneDegrees)
-  local reverse = error > 0
-  if not reverseOnPositive then reverse = not reverse end
-  if inDeadzone then reverse = false end
-  local level = setResistor(state, resistorSide, resistorLevel(command))
-  relay.setOutput(gearshiftSide, reverse)
-  return level, reverse
+  local desiredReverse = error > 0
+  if not reverseOnPositive then desiredReverse = not desiredReverse end
+  if inDeadzone then desiredReverse = false end
+
+  -- Cancel a not-yet-applied reversal if the error returned to the current
+  -- side while the resistor was stopped.
+  if state.pendingReverse and desiredReverse == state.reverse then
+    state.pendingReverse = nil
+    state.stopTicks = 0
+  end
+
+  if state.pendingReverse then
+    forceResistorStop(state, resistorSide)
+    state.stopTicks = state.stopTicks - 1
+    if state.stopTicks <= 0 then
+      -- The output changes only on an actual direction transition. The prior
+      -- tick was guaranteed stopped, so the gearshift never reverses loaded.
+      relay.setOutput(gearshiftSide, state.pendingReverse)
+      state.reverse = state.pendingReverse
+      state.pendingReverse = nil
+    end
+    return 15, state.reverse
+  end
+
+  if desiredReverse ~= state.reverse then
+    state.pendingReverse = desiredReverse
+    state.stopTicks = CONFIG.directionStopTicks
+    forceResistorStop(state, resistorSide)
+    return 15, state.reverse
+  end
+
+  return setResistor(state, resistorSide, resistorLevel(command)), state.reverse
 end
 
 local function stop(relay)
@@ -195,10 +231,13 @@ local function run()
     "No CC:VS ship API. Put this computer on the turret ship.")
   local relay = peripheral.find("redstone_relay")
   assert(relay, "No redstone_relay on the wired modem network.")
+  -- Establish a known, unloaded direction state before control begins.
+  stop(relay)
 
   local target = asQuaternion(ship.getQuaternion())
   local previousYaw, previousPitch = nil, nil
-  local horizontalState, verticalState = { level=nil, cooldown=0 }, { level=nil, cooldown=0 }
+  local horizontalState = { level=15, cooldown=0, reverse=false, pendingReverse=nil, stopTicks=0 }
+  local verticalState = { level=15, cooldown=0, reverse=false, pendingReverse=nil, stopTicks=0 }
   while true do
     local hAim, vAim, right, left, up, down
     target, hAim, vAim, right, left, up, down = updateTarget(target, relay)
