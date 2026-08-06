@@ -27,6 +27,9 @@ local CONFIG = {
 
   fullSpeedAtDegrees = 45,
   deadzoneDegrees = 0.2,
+  -- true: stop inside the position deadzone without changing gear direction.
+  -- false: restore the old behaviour, which returns gearshifts to normal.
+  keepGearshiftDirectionInDeadzone = true,
   proportionalGain = 1,
   derivativeGainSeconds = 0.0005,
   resistorCooldownTicks = 1,
@@ -208,6 +211,13 @@ end
 local function writeAxis(relay, state, resistorSide, gearshiftSide, error,
     command, reverseOnPositive)
   local inDeadzone = math.abs(error) <= math.rad(CONFIG.deadzoneDegrees)
+  if inDeadzone and CONFIG.keepGearshiftDirectionInDeadzone then
+    -- There is no reason to reverse a stopped gearbox just because the target
+    -- was reached. Cancel a queued change and stop transmission immediately.
+    state.switching = false
+    return forceResistorStop(state, resistorSide), state.reverse
+  end
+
   local desiredReverse = error > 0
   if not reverseOnPositive then desiredReverse = not desiredReverse end
   if inDeadzone then desiredReverse = false end
