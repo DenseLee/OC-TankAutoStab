@@ -36,6 +36,9 @@ local CONFIG = {
   -- Remote controller target movement. 90 means full stick moves the saved
   -- aim point by 90 degrees per second.
   aimDegreesPerSecond = 36,
+  -- Controller input level 1..9 creates an increasing target lead. Levels
+  -- 10..15 use this axis's full-speed lead, matching fullSpeedAtDegrees.
+  manualFullSpeedInputLevel = 10,
   aimInputDeadzone = 0.05,
   invertHorizontalAim = true,
   invertVerticalAim = true,
@@ -87,13 +90,18 @@ local function asQuaternion(value)
   return { x=x, y=y, z=z, w=w }
 end
 
-local function getYawPitchError(target)
-  local current = asQuaternion(ship.getQuaternion())
+local function getYawPitchError(target, current)
+  current = current or asQuaternion(ship.getQuaternion())
   local q = normalize(multiply(inverse(current), target))
   local pitch = math.asin(clamp(2 * (q.x*q.w - q.y*q.z), -1, 1))
   local yaw = math.atan(2 * (q.x*q.z + q.y*q.w),
     1 - 2 * (q.x*q.x + q.y*q.y))
   return yaw, pitch
+end
+
+local function manualLeadRadians(rawLevel)
+  local fraction = clamp(rawLevel / CONFIG.manualFullSpeedInputLevel, 0, 1)
+  return math.rad(CONFIG.fullSpeedAtDegrees * fraction)
 end
 
 local function readSignedAxis(positiveSide, negativeSide, reader)
@@ -127,6 +135,29 @@ local function updateTarget(target, relay)
     local yaw = axisAngle(0, 1, 0, horizontal * amount)
     local pitch = axisAngle(1, 0, 0, vertical * amount)
     target = normalize(multiply(yaw, multiply(target, pitch)))
+
+    -- Keep a virtual point ahead of the turret in the direction the player
+    -- is commanding. This preserves world-space stabilization, but prevents
+    -- the turret from catching a slow moving target and being told to reverse.
+    local current = asQuaternion(ship.getQuaternion())
+    local yawError, pitchError = getYawPitchError(target, current)
+    if horizontal ~= 0 then
+      local lead = manualLeadRadians(math.max(right, left))
+      if horizontal * yawError < lead then
+        local wantedError = (horizontal < 0 and -lead or lead)
+        target = normalize(multiply(axisAngle(0, 1, 0, wantedError - yawError), target))
+        yawError, pitchError = getYawPitchError(target, current)
+      end
+    end
+    if vertical ~= 0 then
+      local lead = manualLeadRadians(math.max(up, down))
+      if vertical * pitchError < lead then
+        local wantedError = (vertical < 0 and -lead or lead)
+        local localTarget = multiply(inverse(current), target)
+        local adjustment = axisAngle(1, 0, 0, wantedError - pitchError)
+        target = normalize(multiply(current, multiply(adjustment, localTarget)))
+      end
+    end
   end
   return target, horizontal, vertical, right, left, up, down,
     horizontal ~= 0 or vertical ~= 0
