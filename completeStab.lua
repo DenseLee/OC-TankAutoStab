@@ -36,9 +36,10 @@ local CONFIG = {
   -- Remote controller target movement. 90 means full stick moves the saved
   -- aim point by 90 degrees per second.
   aimDegreesPerSecond = 36,
-  -- Controller input level 1..9 creates an increasing target lead. Levels
-  -- 10..15 use this axis's full-speed lead, matching fullSpeedAtDegrees.
-  manualFullSpeedInputLevel = 10,
+  -- Remote controller speed bands. The virtual target lead maps to roughly
+  -- one-third, two-thirds, and full resistor command respectively.
+  manualLowLeadFraction = 1 / 3,     -- input level 1..10
+  manualMediumLeadFraction = 2 / 3,  -- input level 11..13
   aimInputDeadzone = 0.05,
   invertHorizontalAim = true,
   invertVerticalAim = true,
@@ -100,7 +101,16 @@ local function getYawPitchError(target, current)
 end
 
 local function manualLeadRadians(rawLevel)
-  local fraction = clamp(rawLevel / CONFIG.manualFullSpeedInputLevel, 0, 1)
+  local fraction
+  if rawLevel >= 14 then
+    fraction = 1
+  elseif rawLevel >= 11 then
+    fraction = CONFIG.manualMediumLeadFraction
+  elseif rawLevel >= 1 then
+    fraction = CONFIG.manualLowLeadFraction
+  else
+    fraction = 0
+  end
   return math.rad(CONFIG.fullSpeedAtDegrees * fraction)
 end
 
