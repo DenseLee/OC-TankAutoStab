@@ -37,6 +37,16 @@ local CONFIG = {
   aimReleaseSettleTicks = 2,
   minimumRedstoneResistorLevel = 0,
 
+  -- Adaptive stationary speed cap. When enabled, ordinary stabilization is
+  -- capped at level 6 (about 60% transmission). If an idle axis is already
+  -- capped and its error keeps worsening, it temporarily permits level 0.
+  adaptiveResistorCapEnabled = true,
+  adaptiveStationaryMinimumLevel = 6,
+  adaptiveCatchUpMinimumLevel = 0,
+  adaptiveCatchUpEnterTicks = 3,
+  adaptiveCatchUpExitTicks = 6,
+  adaptiveErrorChangeDegrees = 0.05,
+
   -- Remote controller target movement. 90 means full stick moves the saved
   -- aim point by 90 degrees per second.
   aimDegreesPerSecond = 36,
@@ -173,11 +183,60 @@ local function updateTarget(target, relay)
     horizontal ~= 0 or vertical ~= 0
 end
 
-local function resistorLevel(command)
+local function requestedResistorLevel(command)
   if command <= math.rad(CONFIG.deadzoneDegrees) then return 15 end
   local fraction = clamp(command / math.rad(CONFIG.fullSpeedAtDegrees), 0, 1)
-  local level = 15 - math.floor(fraction * 15 + 0.5)
-  return math.max(CONFIG.minimumRedstoneResistorLevel, level)
+  return 15 - math.floor(fraction * 15 + 0.5)
+end
+
+local function resistorLevel(command, minimumLevel)
+  return math.max(minimumLevel or CONFIG.minimumRedstoneResistorLevel,
+    requestedResistorLevel(command))
+end
+
+local function adaptiveMinimumLevel(state, error, command, playerAiming)
+  local absoluteError = math.abs(error)
+  local normalMinimum = CONFIG.minimumRedstoneResistorLevel
+  local deadzone = math.rad(CONFIG.deadzoneDegrees)
+  local changeThreshold = math.rad(CONFIG.adaptiveErrorChangeDegrees)
+
+  if not CONFIG.adaptiveResistorCapEnabled or playerAiming
+      or absoluteError <= deadzone then
+    state.catchUp = false
+    state.worseningTicks = 0
+    state.improvingTicks = 0
+    state.lastAbsoluteError = absoluteError
+    return normalMinimum
+  end
+
+  normalMinimum = CONFIG.adaptiveStationaryMinimumLevel
+  local change = state.lastAbsoluteError and absoluteError - state.lastAbsoluteError or 0
+  local capIsLimiting = requestedResistorLevel(command) < normalMinimum
+
+  if state.catchUp then
+    if change < -changeThreshold then
+      state.improvingTicks = state.improvingTicks + 1
+    else
+      state.improvingTicks = 0
+    end
+    if state.improvingTicks >= CONFIG.adaptiveCatchUpExitTicks then
+      state.catchUp = false
+      state.worseningTicks = 0
+      state.improvingTicks = 0
+    end
+  elseif capIsLimiting and change > changeThreshold then
+    state.worseningTicks = state.worseningTicks + 1
+    if state.worseningTicks >= CONFIG.adaptiveCatchUpEnterTicks then
+      state.catchUp = true
+      state.improvingTicks = 0
+    end
+  else
+    state.worseningTicks = 0
+  end
+
+  state.lastAbsoluteError = absoluteError
+  if state.catchUp then return CONFIG.adaptiveCatchUpMinimumLevel end
+  return normalMinimum
 end
 
 local function pdCommand(error, previous)
@@ -209,7 +268,7 @@ local function forceResistorStop(state, side)
 end
 
 local function writeAxis(relay, state, resistorSide, gearshiftSide, error,
-    command, reverseOnPositive)
+    command, reverseOnPositive, minimumLevel)
   local inDeadzone = math.abs(error) <= math.rad(CONFIG.deadzoneDegrees)
   if inDeadzone and CONFIG.keepGearshiftDirectionInDeadzone then
     -- There is no reason to reverse a stopped gearbox just because the target
@@ -247,7 +306,7 @@ local function writeAxis(relay, state, resistorSide, gearshiftSide, error,
     return 15, state.reverse
   end
 
-  return setResistor(state, resistorSide, resistorLevel(command)), state.reverse
+  return setResistor(state, resistorSide, resistorLevel(command, minimumLevel)), state.reverse
 end
 
 local function stop(relay)
@@ -316,12 +375,18 @@ local function run()
         hAim, vAim, right, left, up, down)
     else
       local yaw, pitch = getYawPitchError(target)
+      local hMinimum = adaptiveMinimumLevel(horizontalState, yaw,
+        pdCommand(yaw, previousYaw), hAim ~= 0)
+      local vMinimum = adaptiveMinimumLevel(verticalState, pitch,
+        pdCommand(pitch, previousPitch), vAim ~= 0)
       local hLevel, hReverse = writeAxis(relay, horizontalState,
         CONFIG.horizontalOutputSide, CONFIG.horizontalGearshiftSide, yaw,
-        pdCommand(yaw, previousYaw), CONFIG.horizontalReverseOnPositiveError)
+        pdCommand(yaw, previousYaw), CONFIG.horizontalReverseOnPositiveError,
+        hMinimum)
       local vLevel, vReverse = writeAxis(relay, verticalState,
         CONFIG.verticalOutputSide, CONFIG.verticalGearshiftSide, pitch,
-        pdCommand(pitch, previousPitch), CONFIG.verticalReverseOnPositiveError)
+        pdCommand(pitch, previousPitch), CONFIG.verticalReverseOnPositiveError,
+        vMinimum)
       draw(yaw, pitch, hLevel, vLevel, hReverse, vReverse,
         hAim, vAim, right, left, up, down)
       previousYaw, previousPitch = yaw, pitch
