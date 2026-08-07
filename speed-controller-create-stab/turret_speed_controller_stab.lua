@@ -64,6 +64,9 @@ local CONFIG = {
   aimInputCurveExponent = 1.5,
   invertHorizontalAim = true,
   invertVerticalAim = true,
+  -- On releasing both aim axes, hold the actual turret orientation instead
+  -- of returning to a virtual target that may lag behind feed-forward motion.
+  captureTargetOnAimRelease = true,
   loopSeconds = 0.05,
   showDebug = true,
 }
@@ -244,6 +247,7 @@ local function run()
   local target = normalize(asQuaternion(ship.getQuaternion()))
   local yawAxis = newAxisState()
   local pitchAxis = newAxisState()
+  local wasAiming = false
 
   while true do
     local rawYaw = signedInput(yawRelay, CONFIG.yawPositiveSide, CONFIG.yawNegativeSide)
@@ -253,14 +257,20 @@ local function run()
     local yawInput = applyInputCurve(rawYaw, CONFIG.invertHorizontalAim)
     local pitchInput = applyInputCurve(rawPitch, CONFIG.invertVerticalAim)
     local steeringInput = applyInputCurve(rawSteering, false)
+    local current = normalize(asQuaternion(ship.getQuaternion()))
+    local isAiming = yawInput ~= 0 or pitchInput ~= 0
 
-    if yawInput ~= 0 or pitchInput ~= 0 then
+    if isAiming then
       local amount = math.rad(CONFIG.aimDegreesPerSecond * CONFIG.loopSeconds)
       target = normalize(multiply(axisAngle(0, 1, 0, yawInput * amount),
         multiply(target, axisAngle(1, 0, 0, pitchInput * amount))))
+    elseif wasAiming and CONFIG.captureTargetOnAimRelease then
+      -- Feed-forward can move the physical turret faster than the virtual
+      -- target. Re-anchor at release so it holds this exact orientation.
+      target = current
     end
+    wasAiming = isAiming
 
-    local current = normalize(asQuaternion(ship.getQuaternion()))
     local yawError, pitchError = getYawPitchError(target, current)
     local omega = asVector(ship.getOmega(), "ship.getOmega")
     -- Yaw is around world Y. Pitch is around the turret's current local X
