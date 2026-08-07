@@ -15,6 +15,9 @@ local CONFIG = {
   reverseInputSide = "top",
 
   maxDriveRPM = 256,
+  -- Time taken from 0 to full speed is maxDriveRPM / this value.
+  -- 128 means approximately two seconds from 0 to 256 RPM.
+  accelerationRPMPerSecond = 128,
   inputDeadzone = 0.03,
   inputCurveExponent = 1.5,
   loopSeconds = 0.05,
@@ -55,6 +58,13 @@ local function setRPM(rpm)
   end
 end
 
+local function approach(current, target, maximumChange)
+  if target > current then
+    return math.min(current + maximumChange, target)
+  end
+  return math.max(current - maximumChange, target)
+end
+
 local function draw(forward, reverse, input, targetRPM)
   if not CONFIG.showDebug then return end
   term.setCursorPos(1, 1)
@@ -65,7 +75,9 @@ local function draw(forward, reverse, input, targetRPM)
   print(string.format("Forward (front): %2d", forward))
   print(string.format("Reverse (top):   %2d", reverse))
   print(string.format("Drive input:     %+.2f", input))
-  print(string.format("Target speed:    %+d RPM", targetRPM))
+  print(string.format("Requested:       %+d RPM", round(targetRPM)))
+  print(string.format("Commanded:       %+d RPM", commandedRPM))
+  print(string.format("Acceleration:    %d RPM/s", CONFIG.accelerationRPMPerSecond))
   print("")
   print("Both inputs cancel each other.")
 end
@@ -83,9 +95,11 @@ local function run()
     local rawInput = clamp((forward - reverse) / 15, -1, 1)
     local driveInput = curveInput(rawInput)
     local targetRPM = driveInput * CONFIG.maxDriveRPM
+    local maximumChange = CONFIG.accelerationRPMPerSecond * CONFIG.loopSeconds
+    local nextRPM = approach(commandedRPM, targetRPM, maximumChange)
 
-    setRPM(targetRPM)
-    draw(forward, reverse, driveInput, commandedRPM)
+    setRPM(nextRPM)
+    draw(forward, reverse, driveInput, targetRPM)
     sleep(CONFIG.loopSeconds)
   end
 end

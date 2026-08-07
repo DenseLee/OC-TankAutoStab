@@ -34,4 +34,4 @@ If more than one speed controller is connected, set `CONFIG.peripheralName` in t
 - computer top: reverse (`-Y`), through the independently mounted gearbox;
 - computer back: transmission Create Rotation Speed Controller.
 
-It subtracts reverse from forward and commands a signed target speed from `-256` to `+256 RPM`. The `inputCurveExponent` setting gives low stick inputs more precise, slower movement while keeping full stick at full configured speed. Run `Ctrl+T` to stop safely.
+It subtracts reverse from forward and commands a signed target speed from `-256` to `+256 RPM`. `accelerationRPMPerSecond` ramps the command toward that target; its default `128` takes about two seconds to reach full `256 RPM`, including a controlled transition through zero while reversing. The `inputCurveExponent` setting gives low stick inputs more precise, slower movement while keeping full stick at full configured speed. Run `Ctrl+T` to stop safely.
