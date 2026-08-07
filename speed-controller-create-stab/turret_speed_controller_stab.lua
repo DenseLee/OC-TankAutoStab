@@ -23,8 +23,8 @@ local CONFIG = {
 
   -- Run peripheral_check.lua on the turret computer and put the exact two
   -- relay names here. They must be different.
-  yawRelayName = "SET_YAW_RELAY_NAME",
-  pitchRelayName = "SET_PITCH_RELAY_NAME",
+  yawRelayName = "redstone_relay_4",
+  pitchRelayName = "redstone_relay_2",
   yawPositiveSide = "top",
   yawNegativeSide = "bottom",
   pitchPositiveSide = "top",
@@ -34,20 +34,28 @@ local CONFIG = {
   steeringNegativeSide = "bottom",
 
   -- Maximum signed RPM sent to the hull controllers.
-  maxYawRPM = 256,
-  maxPitchRPM = 256,
+  maxYawRPM = 40,
+  maxPitchRPM = 40,
   yawPositiveRPMReversed = false,
   pitchPositiveRPMReversed = false,
 
-  fullSpeedAtDegrees = 45,
   deadzoneDegrees = 0.2,
-  proportionalGain = 1,
-  -- Hybrid velocity damping. CC:VS reports omega in radians per second.
-  -- 60/(2*pi) is the 1:1 rad/s-to-RPM conversion from the simple controller
-  -- example. Change each scale for your actual shaft-to-turret gearing.
-  yawOmegaToRPM = 60 / (2 * math.pi),
-  pitchOmegaToRPM = 60 / (2 * math.pi),
-  omegaLookAheadSeconds = 0.10,
+  -- Outer loop: the desired angular speed is error / response time.
+  -- Smaller values correct faster; output still cannot exceed max axis RPM.
+  targetResponseSeconds = 1.0,
+  -- Inner rate correction. It compares desired and measured turret rate.
+  rateFeedbackGain = 0.20,
+
+  -- Learned plant response, in turret degrees/second per controller RPM.
+  -- 0.0055 is the initial estimate from 0.07 degrees/tick at 256 RPM.
+  -- The estimate adapts only during steady manual movement.
+  initialYawDegreesPerSecondPerRPM = 0.0055,
+  initialPitchDegreesPerSecondPerRPM = 0.0055,
+  plantLearningRate = 0.02,
+  plantLearningMinimumRPM = 30,
+  plantLearningMaximumAccelerationDegrees = 3,
+  minimumPlantGain = 0.0005,
+  maximumPlantGain = 0.10,
   yawOmegaSign = 1,
   pitchOmegaSign = 1,
   -- Largest command change each second. This is a command smoother, not a
@@ -58,8 +66,8 @@ local CONFIG = {
   -- Direct RPM contribution while the player is aiming. Tune these so a full
   -- stick roughly matches aimDegreesPerSecond through your turret gearing.
   -- The PD correction remains active to hold the world-space target.
-  manualAimMaxYawRPM = 256,
-  manualAimMaxPitchRPM = 256,
+  manualAimMaxYawRPM = 40,
+  manualAimMaxPitchRPM = 40,
   aimInputDeadzone = 0.05,
   aimInputCurveExponent = 1.5,
   invertHorizontalAim = true,
@@ -173,34 +181,42 @@ local function approach(current, target, maximumChange)
   return math.max(current - maximumChange, target)
 end
 
-local function newAxisState()
-  return { lastOmega = 0, commandRPM = 0 }
+local function newAxisState(initialPlantGain)
+  return { lastOmega = 0, commandRPM = 0, plantGain = initialPlantGain }
 end
 
 local function rpmForError(errorRadians, state, maximumRPM, reversed, feedforwardRPM,
-  angularVelocity, omegaToRPM)
+  angularVelocity, isManualAiming)
   local errorDegrees = degrees(errorRadians)
-  local angularAcceleration = (angularVelocity - state.lastOmega) / CONFIG.loopSeconds
-  state.lastOmega = angularVelocity
+  local angularVelocityDegrees = degrees(angularVelocity)
+  local angularAcceleration = (angularVelocityDegrees - state.lastOmega) / CONFIG.loopSeconds
+  state.lastOmega = angularVelocityDegrees
 
-  local proportionalRPM = CONFIG.proportionalGain * errorDegrees
-    / CONFIG.fullSpeedAtDegrees * maximumRPM
-  -- Predict short-term continued motion, then oppose both current angular
-  -- velocity and its acceleration. This replaces the old error-history D.
-  local motionRPM = -(angularVelocity
-    + angularAcceleration * CONFIG.omegaLookAheadSeconds) * omegaToRPM
-  local feedbackRPM = proportionalRPM + motionRPM
-  if math.abs(errorDegrees) <= CONFIG.deadzoneDegrees then feedbackRPM = 0 end
-  -- The derivative term may reduce a closing correction to zero, but do not
-  -- command the opposite direction before the turret has actually crossed
-  -- the target. This prevents derivative noise from creating a tiny reversal.
-  if errorDegrees > CONFIG.deadzoneDegrees then feedbackRPM = math.max(0, feedbackRPM) end
-  if errorDegrees < -CONFIG.deadzoneDegrees then feedbackRPM = math.min(0, feedbackRPM) end
+  -- Learn the actual turret rate produced by a controller RPM only while a
+  -- manual command is steady. This avoids learning hull shocks as gearing.
+  local learningRPM = state.commandRPM
+  if isManualAiming and math.abs(learningRPM) >= CONFIG.plantLearningMinimumRPM
+    and math.abs(angularAcceleration) <= CONFIG.plantLearningMaximumAccelerationDegrees
+    and learningRPM * angularVelocityDegrees > 0 then
+    local sample = clamp(math.abs(angularVelocityDegrees / learningRPM),
+      CONFIG.minimumPlantGain, CONFIG.maximumPlantGain)
+    state.plantGain = state.plantGain + CONFIG.plantLearningRate
+      * (sample - state.plantGain)
+  end
 
-  -- Feed-forward gives manual target movement an immediate RPM command. It
-  -- must remain separate from the direction guard above: reversing the stick
-  -- may legitimately oppose the old positional error for a moment.
-  local desiredRPM = feedbackRPM + feedforwardRPM
+  -- Desired rate comes from position error, plus direct manual aim rate.
+  -- The measured rate closes the inner loop without requiring an error
+  -- history or a fixed degrees-to-RPM proportional scale.
+  local positionRate = 0
+  if math.abs(errorDegrees) > CONFIG.deadzoneDegrees then
+    positionRate = errorDegrees / CONFIG.targetResponseSeconds
+  end
+  local desiredRate = feedforwardRPM * state.plantGain + positionRate
+  local maximumRate = maximumRPM * state.plantGain
+  desiredRate = clamp(desiredRate, -maximumRate, maximumRate)
+  local rateError = desiredRate - angularVelocityDegrees
+  local desiredRPM = desiredRate / state.plantGain
+    + CONFIG.rateFeedbackGain * rateError / state.plantGain
   local rpm = clamp(desiredRPM,
     -maximumRPM, maximumRPM)
   if reversed then rpm = -rpm end
@@ -210,7 +226,7 @@ local function rpmForError(errorRadians, state, maximumRPM, reversed, feedforwar
   if desiredRPM == 0 and math.abs(state.commandRPM) < 0.5 then state.commandRPM = 0 end
   rpm = state.commandRPM
   if rpm < 0 then rpm = math.ceil(rpm - 0.5) else rpm = math.floor(rpm + 0.5) end
-  return rpm, errorDegrees
+  return rpm, errorDegrees, state.plantGain, desiredRate
 end
 
 local function send(command)
@@ -222,7 +238,7 @@ local function send(command)
 end
 
 local function draw(yawInput, pitchInput, steeringInput, yawFeedforward, pitchFeedforward,
-  yawError, pitchError, yawOmega, pitchOmega, yawRPM, pitchRPM)
+  yawError, pitchError, yawOmega, pitchOmega, yawGain, pitchGain, yawRPM, pitchRPM)
   if not CONFIG.showDebug then return end
   term.setCursorPos(1, 1)
   term.clear()
@@ -235,6 +251,7 @@ local function draw(yawInput, pitchInput, steeringInput, yawFeedforward, pitchFe
   print(string.format("Yaw error:     %+.2f deg", yawError))
   print(string.format("Pitch error:   %+.2f deg", pitchError))
   print(string.format("Omega Y/P:     %+.2f / %+.2f rad/s", yawOmega, pitchOmega))
+  print(string.format("Gain Y/P:      %.5f / %.5f deg/s/RPM", yawGain, pitchGain))
   print(string.format("Yaw RPM:       %+d", yawRPM))
   print(string.format("Pitch RPM:     %+d", pitchRPM))
 end
@@ -245,8 +262,8 @@ local function run()
   local pitchRelay = getRelay(CONFIG.pitchRelayName, "pitchRelayName")
   local steeringRelay = getRelay(CONFIG.steeringRelayName, "steeringRelayName")
   local target = normalize(asQuaternion(ship.getQuaternion()))
-  local yawAxis = newAxisState()
-  local pitchAxis = newAxisState()
+  local yawAxis = newAxisState(CONFIG.initialYawDegreesPerSecondPerRPM)
+  local pitchAxis = newAxisState(CONFIG.initialPitchDegreesPerSecondPerRPM)
   local wasAiming = false
 
   while true do
@@ -280,17 +297,17 @@ local function run()
       * CONFIG.pitchOmegaSign
     local yawFeedforward = yawInput * CONFIG.manualAimMaxYawRPM
     local pitchFeedforward = pitchInput * CONFIG.manualAimMaxPitchRPM
-    local yawRPM, yawDegrees = rpmForError(yawError, yawAxis,
+    local yawRPM, yawDegrees, yawGain = rpmForError(yawError, yawAxis,
       CONFIG.maxYawRPM, CONFIG.yawPositiveRPMReversed, yawFeedforward,
-      yawOmega, CONFIG.yawOmegaToRPM)
-    local pitchRPM, pitchDegrees = rpmForError(pitchError, pitchAxis,
+      yawOmega, isAiming)
+    local pitchRPM, pitchDegrees, pitchGain = rpmForError(pitchError, pitchAxis,
       CONFIG.maxPitchRPM, CONFIG.pitchPositiveRPMReversed, pitchFeedforward,
-      pitchOmega, CONFIG.pitchOmegaToRPM)
+      pitchOmega, isAiming)
 
     send({ kind="aim_rpm", yawRPM=yawRPM, pitchRPM=pitchRPM,
       steering=steeringInput })
     draw(yawInput, pitchInput, steeringInput, yawFeedforward, pitchFeedforward,
-      yawDegrees, pitchDegrees, yawOmega, pitchOmega, yawRPM, pitchRPM)
+      yawDegrees, pitchDegrees, yawOmega, pitchOmega, yawGain, pitchGain, yawRPM, pitchRPM)
     sleep(CONFIG.loopSeconds)
   end
 end
