@@ -53,6 +53,11 @@ local CONFIG = {
   maxRPMChangePerSecond = 1600,
 
   aimDegreesPerSecond = 36,
+  -- Direct RPM contribution while the player is aiming. Tune these so a full
+  -- stick roughly matches aimDegreesPerSecond through your turret gearing.
+  -- The PD correction remains active to hold the world-space target.
+  manualAimMaxYawRPM = 256,
+  manualAimMaxPitchRPM = 256,
   aimInputDeadzone = 0.05,
   aimInputCurveExponent = 1.5,
   invertHorizontalAim = true,
@@ -151,7 +156,7 @@ local function newAxisState()
   return { errors = {}, filteredRate = 0, commandRPM = 0 }
 end
 
-local function rpmForError(errorRadians, state, maximumRPM, reversed)
+local function rpmForError(errorRadians, state, maximumRPM, reversed, feedforwardRPM)
   local errorDegrees = degrees(errorRadians)
   local errors = state.errors
   table.insert(errors, errorDegrees)
@@ -167,13 +172,18 @@ local function rpmForError(errorRadians, state, maximumRPM, reversed)
     / CONFIG.fullSpeedAtDegrees * maximumRPM
   local derivativeRPM = state.filteredRate
     * CONFIG.derivativeGainRPMPerDegreePerSecond
-  local desiredRPM = proportionalRPM + derivativeRPM
-  if math.abs(errorDegrees) <= CONFIG.deadzoneDegrees then desiredRPM = 0 end
+  local feedbackRPM = proportionalRPM + derivativeRPM
+  if math.abs(errorDegrees) <= CONFIG.deadzoneDegrees then feedbackRPM = 0 end
   -- The derivative term may reduce a closing correction to zero, but do not
   -- command the opposite direction before the turret has actually crossed
   -- the target. This prevents derivative noise from creating a tiny reversal.
-  if errorDegrees > CONFIG.deadzoneDegrees then desiredRPM = math.max(0, desiredRPM) end
-  if errorDegrees < -CONFIG.deadzoneDegrees then desiredRPM = math.min(0, desiredRPM) end
+  if errorDegrees > CONFIG.deadzoneDegrees then feedbackRPM = math.max(0, feedbackRPM) end
+  if errorDegrees < -CONFIG.deadzoneDegrees then feedbackRPM = math.min(0, feedbackRPM) end
+
+  -- Feed-forward gives manual target movement an immediate RPM command. It
+  -- must remain separate from the direction guard above: reversing the stick
+  -- may legitimately oppose the old positional error for a moment.
+  local desiredRPM = feedbackRPM + feedforwardRPM
   local rpm = clamp(desiredRPM,
     -maximumRPM, maximumRPM)
   if reversed then rpm = -rpm end
@@ -194,7 +204,8 @@ local function send(command)
   end
 end
 
-local function draw(yawInput, pitchInput, steeringInput, yawError, pitchError, yawRPM, pitchRPM)
+local function draw(yawInput, pitchInput, steeringInput, yawFeedforward, pitchFeedforward,
+  yawError, pitchError, yawRPM, pitchRPM)
   if not CONFIG.showDebug then return end
   term.setCursorPos(1, 1)
   term.clear()
@@ -203,6 +214,7 @@ local function draw(yawInput, pitchInput, steeringInput, yawError, pitchError, y
   print("")
   print(string.format("Aim X/Y:       %+.2f / %+.2f", yawInput, pitchInput))
   print(string.format("Steering X:    %+.2f", steeringInput))
+  print(string.format("Aim FF RPM:    %+.0f / %+.0f", yawFeedforward, pitchFeedforward))
   print(string.format("Yaw error:     %+.2f deg", yawError))
   print(string.format("Pitch error:   %+.2f deg", pitchError))
   print(string.format("Yaw RPM:       %+d", yawRPM))
@@ -235,14 +247,17 @@ local function run()
 
     local current = normalize(asQuaternion(ship.getQuaternion()))
     local yawError, pitchError = getYawPitchError(target, current)
+    local yawFeedforward = yawInput * CONFIG.manualAimMaxYawRPM
+    local pitchFeedforward = pitchInput * CONFIG.manualAimMaxPitchRPM
     local yawRPM, yawDegrees = rpmForError(yawError, yawAxis,
-      CONFIG.maxYawRPM, CONFIG.yawPositiveRPMReversed)
+      CONFIG.maxYawRPM, CONFIG.yawPositiveRPMReversed, yawFeedforward)
     local pitchRPM, pitchDegrees = rpmForError(pitchError, pitchAxis,
-      CONFIG.maxPitchRPM, CONFIG.pitchPositiveRPMReversed)
+      CONFIG.maxPitchRPM, CONFIG.pitchPositiveRPMReversed, pitchFeedforward)
 
     send({ kind="aim_rpm", yawRPM=yawRPM, pitchRPM=pitchRPM,
       steering=steeringInput })
-    draw(yawInput, pitchInput, steeringInput, yawDegrees, pitchDegrees, yawRPM, pitchRPM)
+    draw(yawInput, pitchInput, steeringInput, yawFeedforward, pitchFeedforward,
+      yawDegrees, pitchDegrees, yawRPM, pitchRPM)
     sleep(CONFIG.loopSeconds)
   end
 end
