@@ -4,15 +4,22 @@
 --   computer front = controller left-stick +Y (forward)
 --   computer top   = controller left-stick -Y (reverse), through gearbox
 --   computer back  = Create Rotation Speed Controller for transmission
---   computer bottom = wireless modem (unused by this standalone drive test)
+--   computer left  = Create Rotation Speed Controller for turret yaw
+--   computer right = Create Rotation Speed Controller for gun elevation
+--   computer bottom = wireless modem from the turret computer
 --
 -- Redstone levels are 0..15. The two directions are subtracted, so if both
 -- are active at once they cancel instead of commanding both directions.
 
 local CONFIG = {
   transmissionControllerSide = "back",
+  yawControllerSide = "left",
+  pitchControllerSide = "right",
   forwardInputSide = "front",
   reverseInputSide = "top",
+  wirelessModemSide = "bottom",
+  aimProtocol = "tank_speed_stab",
+  aimTimeoutTicks = 4,
 
   maxDriveRPM = 256,
   -- Used only while an input is held. Time from 0 to full speed is
@@ -31,14 +38,23 @@ if not transmission or type(transmission.setTargetSpeed) ~= "function" then
     .. ". Run peripheral_check.lua on the hull computer.")
 end
 
+local yawController = peripheral.wrap(CONFIG.yawControllerSide)
+local pitchController = peripheral.wrap(CONFIG.pitchControllerSide)
+if not yawController or type(yawController.setTargetSpeed) ~= "function"
+  or not pitchController or type(pitchController.setTargetSpeed) ~= "function" then
+  error("Missing yaw or pitch Create Rotation Speed Controller. Check left/right sides.")
+end
+
 local commandedRPM = 0
+local commandedYawRPM, commandedPitchRPM = 0, 0
 
 local function clamp(value, low, high)
   return math.max(low, math.min(high, value))
 end
 
 local function round(value)
-  return math.floor(value + (value >= 0 and 0.5 or -0.5))
+  if value < 0 then return math.ceil(value - 0.5) end
+  return math.floor(value + 0.5)
 end
 
 local function curveInput(value)
@@ -59,6 +75,12 @@ local function setRPM(rpm)
   end
 end
 
+local function setAimRPM(controller, rpm, previous)
+  rpm = round(rpm)
+  if rpm ~= previous then controller.setTargetSpeed(rpm) end
+  return rpm
+end
+
 local function approach(current, target, maximumChange)
   if target > current then
     return math.min(current + maximumChange, target)
@@ -66,7 +88,7 @@ local function approach(current, target, maximumChange)
   return math.max(current - maximumChange, target)
 end
 
-local function draw(forward, reverse, input, targetRPM)
+local function draw(forward, reverse, input, targetRPM, timeoutTicks)
   if not CONFIG.showDebug then return end
   term.setCursorPos(1, 1)
   term.clear()
@@ -79,43 +101,72 @@ local function draw(forward, reverse, input, targetRPM)
   print(string.format("Requested:       %+d RPM", round(targetRPM)))
   print(string.format("Commanded:       %+d RPM", commandedRPM))
   print(string.format("Acceleration:    %d RPM/s", CONFIG.accelerationRPMPerSecond))
+  print(string.format("Yaw / pitch:     %+d / %+d RPM", commandedYawRPM, commandedPitchRPM))
+  print(string.format("Aim link ticks:  %d", timeoutTicks))
   print("")
   print("Both inputs cancel each other.")
+end
+
+local function updateDrive()
+  local forward = redstone.getAnalogInput(CONFIG.forwardInputSide)
+  local reverse = redstone.getAnalogInput(CONFIG.reverseInputSide)
+
+  local rawInput = clamp((forward - reverse) / 15, -1, 1)
+  local driveInput = curveInput(rawInput)
+  local targetRPM = driveInput * CONFIG.maxDriveRPM
+  local nextRPM
+  if driveInput == 0 then
+    -- Do not let the acceleration ramp leave a stale movement command after
+    -- the player releases the stick. This also prevents turn-only inputs
+    -- from causing a short forward creep.
+    nextRPM = 0
+  else
+    local maximumChange = CONFIG.accelerationRPMPerSecond * CONFIG.loopSeconds
+    nextRPM = approach(commandedRPM, targetRPM, maximumChange)
+  end
+
+  setRPM(nextRPM)
+  return forward, reverse, driveInput, targetRPM
 end
 
 local function run()
   -- Synchronize the controller with our cached value before reading input.
   -- This prevents an old command from a previous program continuing at boot.
   transmission.setTargetSpeed(0)
+  yawController.setTargetSpeed(0)
+  pitchController.setTargetSpeed(0)
   commandedRPM = 0
+  commandedYawRPM, commandedPitchRPM = 0, 0
+  rednet.open(CONFIG.wirelessModemSide)
+
+  local timeoutTicks = CONFIG.aimTimeoutTicks + 1
+  local timer = os.startTimer(CONFIG.loopSeconds)
 
   while true do
-    local forward = redstone.getAnalogInput(CONFIG.forwardInputSide)
-    local reverse = redstone.getAnalogInput(CONFIG.reverseInputSide)
-
-    local rawInput = clamp((forward - reverse) / 15, -1, 1)
-    local driveInput = curveInput(rawInput)
-    local targetRPM = driveInput * CONFIG.maxDriveRPM
-    local nextRPM
-    if driveInput == 0 then
-      -- Do not let the acceleration ramp leave a stale movement command after
-      -- the player releases the stick. This also prevents turn-only inputs
-      -- from causing a short forward creep.
-      nextRPM = 0
-    else
-      local maximumChange = CONFIG.accelerationRPMPerSecond * CONFIG.loopSeconds
-      nextRPM = approach(commandedRPM, targetRPM, maximumChange)
+    local event, first, second, third = os.pullEvent()
+    if event == "rednet_message" and third == CONFIG.aimProtocol
+      and type(second) == "table" and second.kind == "aim_rpm" then
+      commandedYawRPM = setAimRPM(yawController, second.yawRPM or 0, commandedYawRPM)
+      commandedPitchRPM = setAimRPM(pitchController, second.pitchRPM or 0, commandedPitchRPM)
+      timeoutTicks = 0
+    elseif event == "timer" and first == timer then
+      local forward, reverse, driveInput, targetRPM = updateDrive()
+      timeoutTicks = timeoutTicks + 1
+      if timeoutTicks > CONFIG.aimTimeoutTicks then
+        commandedYawRPM = setAimRPM(yawController, 0, commandedYawRPM)
+        commandedPitchRPM = setAimRPM(pitchController, 0, commandedPitchRPM)
+      end
+      draw(forward, reverse, driveInput, targetRPM, timeoutTicks)
+      timer = os.startTimer(CONFIG.loopSeconds)
     end
-
-    setRPM(nextRPM)
-    draw(forward, reverse, driveInput, targetRPM)
-    sleep(CONFIG.loopSeconds)
   end
 end
 
 local ok, err = pcall(run)
 -- Never leave the drive transmission spinning if this program ends.
 pcall(function() transmission.setTargetSpeed(0) end)
+pcall(function() yawController.setTargetSpeed(0) end)
+pcall(function() pitchController.setTargetSpeed(0) end)
 
 if not ok then
   term.setCursorPos(1, 10)

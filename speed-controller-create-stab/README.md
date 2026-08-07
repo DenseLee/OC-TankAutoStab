@@ -35,3 +35,9 @@ If more than one speed controller is connected, set `CONFIG.peripheralName` in t
 - computer back: transmission Create Rotation Speed Controller.
 
 It subtracts reverse from forward and commands a signed target speed from `-256` to `+256 RPM`. `accelerationRPMPerSecond` ramps the command toward that target only while an input is held; its default `128` takes about two seconds to reach full `256 RPM`. Releasing the stick commands `0 RPM` immediately, preventing a stale acceleration command from causing forward creep. The `inputCurveExponent` setting gives low stick inputs more precise, slower movement while keeping full stick at full configured speed. Run `Ctrl+T` to stop safely.
+
+## Turret stabilization over wireless
+
+Run `turret_speed_controller_stab.lua` on the turret computer. Its front wireless modem sends signed yaw/pitch RPM commands to the hull computer's bottom wireless modem. Set the exact two relay names in the turret script after running `peripheral_check.lua` there. The horizontal relay's top/bottom faces provide aim X+/X-; the vertical relay's top/bottom faces provide aim Y+/Y-.
+
+Run `computer_assisted_driving.lua` on the hull computer. It now controls all three direct-attached Speed Controllers: back for transmission, left for turret yaw, and right for gun elevation. It stops yaw and elevation within four ticks if the turret radio messages cease. Direct external steering gearshifts remain separate from both scripts.
