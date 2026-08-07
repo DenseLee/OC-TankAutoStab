@@ -140,26 +140,38 @@ local function run()
   rednet.open(CONFIG.wirelessModemSide)
 
   local timeoutTicks = CONFIG.aimTimeoutTicks + 1
-  local timer = os.startTimer(CONFIG.loopSeconds)
 
-  while true do
-    local event, first, second, third = os.pullEvent()
-    if event == "rednet_message" and third == CONFIG.aimProtocol
-      and type(second) == "table" and second.kind == "aim_rpm" then
-      commandedYawRPM = setAimRPM(yawController, second.yawRPM or 0, commandedYawRPM)
-      commandedPitchRPM = setAimRPM(pitchController, second.pitchRPM or 0, commandedPitchRPM)
-      timeoutTicks = 0
-    elseif event == "timer" and first == timer then
+  -- Keep reception separate from the fixed-tick drive loop. A continuous
+  -- stream of turret packets must never postpone local throttle updates.
+  local targetYawRPM, targetPitchRPM = 0, 0
+  local function receiveAimCommands()
+    while true do
+      local _, command = rednet.receive(CONFIG.aimProtocol)
+      if type(command) == "table" and command.kind == "aim_rpm" then
+        targetYawRPM = command.yawRPM or 0
+        targetPitchRPM = command.pitchRPM or 0
+        timeoutTicks = 0
+      end
+    end
+  end
+
+  local function fixedTickLoop()
+    while true do
       local forward, reverse, driveInput, targetRPM = updateDrive()
-      timeoutTicks = timeoutTicks + 1
       if timeoutTicks > CONFIG.aimTimeoutTicks then
         commandedYawRPM = setAimRPM(yawController, 0, commandedYawRPM)
         commandedPitchRPM = setAimRPM(pitchController, 0, commandedPitchRPM)
+      else
+        commandedYawRPM = setAimRPM(yawController, targetYawRPM, commandedYawRPM)
+        commandedPitchRPM = setAimRPM(pitchController, targetPitchRPM, commandedPitchRPM)
       end
+      timeoutTicks = timeoutTicks + 1
       draw(forward, reverse, driveInput, targetRPM, timeoutTicks)
-      timer = os.startTimer(CONFIG.loopSeconds)
+      sleep(CONFIG.loopSeconds)
     end
   end
+
+  parallel.waitForAny(receiveAimCommands, fixedTickLoop)
 end
 
 local ok, err = pcall(run)
