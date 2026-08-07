@@ -74,6 +74,9 @@ local CONFIG = {
   -- Keep a held stick's requested RPM direct and predictable. The adaptive
   -- rate loop resumes as soon as that axis is released.
   manualAimBypassesRateFeedback = true,
+  -- Keep position correction active while aiming. Set false to immediately
+  -- return to the earlier direct-manual-only behavior.
+  blendManualAimWithStabilization = true,
   aimInputDeadzone = 0.05,
   -- Higher exponent makes small analogue inputs much slower and more precise.
   aimInputCurveExponent = 2.5,
@@ -222,7 +225,7 @@ local function rpmForError(errorRadians, state, maximumRPM, reversed, feedforwar
     -- Bypass rate braking for this test. With the configured RPM slew this
     -- reaches 0 in one tick at the current 40 RPM output limit.
     desiredRPM = 0
-  elseif CONFIG.manualAimBypassesRateFeedback and feedforwardRPM ~= 0 then
+  elseif not CONFIG.blendManualAimWithStabilization and feedforwardRPM ~= 0 then
     -- Do not let a noisy/incorrect omega estimate slow a held manual input.
     -- Target re-capture on release still returns control to stabilization.
     desiredRPM = feedforwardRPM
@@ -232,12 +235,16 @@ local function rpmForError(errorRadians, state, maximumRPM, reversed, feedforwar
     if math.abs(errorDegrees) > CONFIG.deadzoneDegrees then
       positionRate = errorDegrees / CONFIG.targetResponseSeconds
     end
+    -- Add world-space hold correction to the requested manual rate. This
+    -- means hull stabilization remains effective while the gunner is aiming.
     desiredRate = feedforwardRPM * state.plantGain + positionRate
     local maximumRate = maximumRPM * state.plantGain
     desiredRate = clamp(desiredRate, -maximumRate, maximumRate)
-    local rateError = desiredRate - angularVelocityDegrees
     desiredRPM = desiredRate / state.plantGain
-      + CONFIG.rateFeedbackGain * rateError / state.plantGain
+    if not (CONFIG.manualAimBypassesRateFeedback and feedforwardRPM ~= 0) then
+      local rateError = desiredRate - angularVelocityDegrees
+      desiredRPM = desiredRPM + CONFIG.rateFeedbackGain * rateError / state.plantGain
+    end
   end
   local rpm = clamp(desiredRPM,
     -maximumRPM, maximumRPM)
