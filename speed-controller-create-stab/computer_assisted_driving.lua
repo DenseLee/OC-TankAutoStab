@@ -22,6 +22,9 @@ local CONFIG = {
   aimTimeoutTicks = 4,
 
   maxDriveRPM = 256,
+  -- Used when steering is held with no forward/reverse throttle. The direct
+  -- steering gearshifts choose the pivot direction; this is always positive.
+  pivotTurnRPM = 96,
   -- Used only while an input is held. Time from 0 to full speed is
   -- maxDriveRPM / this value; 128 is about two seconds to 256 RPM.
   -- Releasing both directions always commands 0 RPM immediately.
@@ -88,7 +91,7 @@ local function approach(current, target, maximumChange)
   return math.max(current - maximumChange, target)
 end
 
-local function draw(forward, reverse, input, targetRPM, timeoutTicks)
+local function draw(forward, reverse, input, steering, targetRPM, timeoutTicks)
   if not CONFIG.showDebug then return end
   term.setCursorPos(1, 1)
   term.clear()
@@ -98,6 +101,7 @@ local function draw(forward, reverse, input, targetRPM, timeoutTicks)
   print(string.format("Forward (front): %2d", forward))
   print(string.format("Reverse (top):   %2d", reverse))
   print(string.format("Drive input:     %+.2f", input))
+  print(string.format("Steering input:  %+.2f", steering))
   print(string.format("Requested:       %+d RPM", round(targetRPM)))
   print(string.format("Commanded:       %+d RPM", commandedRPM))
   print(string.format("Acceleration:    %d RPM/s", CONFIG.accelerationRPMPerSecond))
@@ -107,15 +111,21 @@ local function draw(forward, reverse, input, targetRPM, timeoutTicks)
   print("Both inputs cancel each other.")
 end
 
-local function updateDrive()
+local function updateDrive(steeringInput)
   local forward = redstone.getAnalogInput(CONFIG.forwardInputSide)
   local reverse = redstone.getAnalogInput(CONFIG.reverseInputSide)
 
   local rawInput = clamp((forward - reverse) / 15, -1, 1)
   local driveInput = curveInput(rawInput)
+  local pivotInput = math.abs(steeringInput)
   local targetRPM = driveInput * CONFIG.maxDriveRPM
+  if driveInput == 0 and pivotInput > 0 then
+    -- The direct gearshifts select which track is reversed. Keep this RPM
+    -- positive: the steering hardware, not the computer, selects turn side.
+    targetRPM = pivotInput * CONFIG.pivotTurnRPM
+  end
   local nextRPM
-  if driveInput == 0 then
+  if driveInput == 0 and pivotInput == 0 then
     -- Do not let the acceleration ramp leave a stale movement command after
     -- the player releases the stick. This also prevents turn-only inputs
     -- from causing a short forward creep.
@@ -143,13 +153,14 @@ local function run()
 
   -- Keep reception separate from the fixed-tick drive loop. A continuous
   -- stream of turret packets must never postpone local throttle updates.
-  local targetYawRPM, targetPitchRPM = 0, 0
+  local targetYawRPM, targetPitchRPM, targetSteering = 0, 0, 0
   local function receiveAimCommands()
     while true do
       local _, command = rednet.receive(CONFIG.aimProtocol)
       if type(command) == "table" and command.kind == "aim_rpm" then
         targetYawRPM = command.yawRPM or 0
         targetPitchRPM = command.pitchRPM or 0
+        targetSteering = command.steering or 0
         timeoutTicks = 0
       end
     end
@@ -157,7 +168,8 @@ local function run()
 
   local function fixedTickLoop()
     while true do
-      local forward, reverse, driveInput, targetRPM = updateDrive()
+      local steeringInput = timeoutTicks > CONFIG.aimTimeoutTicks and 0 or targetSteering
+      local forward, reverse, driveInput, targetRPM = updateDrive(steeringInput)
       if timeoutTicks > CONFIG.aimTimeoutTicks then
         commandedYawRPM = setAimRPM(yawController, 0, commandedYawRPM)
         commandedPitchRPM = setAimRPM(pitchController, 0, commandedPitchRPM)
@@ -166,7 +178,7 @@ local function run()
         commandedPitchRPM = setAimRPM(pitchController, targetPitchRPM, commandedPitchRPM)
       end
       timeoutTicks = timeoutTicks + 1
-      draw(forward, reverse, driveInput, targetRPM, timeoutTicks)
+      draw(forward, reverse, driveInput, steeringInput, targetRPM, timeoutTicks)
       sleep(CONFIG.loopSeconds)
     end
   end

@@ -7,6 +7,8 @@
 -- Relay wiring (faces are relative to the relay blocks):
 --   horizontal/yaw relay: top = aim right (+X), bottom = aim left (-X)
 --   vertical/pitch relay: top = aim up (+Y), bottom = aim down (-Y)
+--   horizontal/yaw relay: front = steering right (+X)
+--   vertical/pitch relay: front = steering left (-X)
 --
 -- The turret computer owns the target because it is on the turret ship and
 -- can therefore read that ship's quaternion. It sends signed RPM commands to
@@ -27,6 +29,8 @@ local CONFIG = {
   yawNegativeSide = "bottom",
   pitchPositiveSide = "top",
   pitchNegativeSide = "bottom",
+  steeringPositiveSide = "front",
+  steeringNegativeSide = "front",
 
   -- Maximum signed RPM sent to the hull controllers.
   maxYawRPM = 256,
@@ -151,7 +155,7 @@ local function send(command)
   end
 end
 
-local function draw(yawInput, pitchInput, yawError, pitchError, yawRPM, pitchRPM)
+local function draw(yawInput, pitchInput, steeringInput, yawError, pitchError, yawRPM, pitchRPM)
   if not CONFIG.showDebug then return end
   term.setCursorPos(1, 1)
   term.clear()
@@ -159,6 +163,7 @@ local function draw(yawInput, pitchInput, yawError, pitchError, yawRPM, pitchRPM
   print("Ctrl+T stops hull aim motors")
   print("")
   print(string.format("Aim X/Y:       %+.2f / %+.2f", yawInput, pitchInput))
+  print(string.format("Steering X:    %+.2f", steeringInput))
   print(string.format("Yaw error:     %+.2f deg", yawError))
   print(string.format("Pitch error:   %+.2f deg", pitchError))
   print(string.format("Yaw RPM:       %+d", yawRPM))
@@ -175,8 +180,13 @@ local function run()
   while true do
     local rawYaw = signedInput(yawRelay, CONFIG.yawPositiveSide, CONFIG.yawNegativeSide)
     local rawPitch = signedInput(pitchRelay, CONFIG.pitchPositiveSide, CONFIG.pitchNegativeSide)
+    -- Steering sides live on separate relays, so read and combine them here.
+    local steeringPositive = yawRelay.getAnalogInput(CONFIG.steeringPositiveSide)
+    local steeringNegative = pitchRelay.getAnalogInput(CONFIG.steeringNegativeSide)
+    local rawSteering = clamp((steeringPositive - steeringNegative) / 15, -1, 1)
     local yawInput = applyInputCurve(rawYaw, CONFIG.invertHorizontalAim)
     local pitchInput = applyInputCurve(rawPitch, CONFIG.invertVerticalAim)
+    local steeringInput = applyInputCurve(rawSteering, false)
 
     if yawInput ~= 0 or pitchInput ~= 0 then
       local amount = math.rad(CONFIG.aimDegreesPerSecond * CONFIG.loopSeconds)
@@ -192,8 +202,9 @@ local function run()
       CONFIG.maxPitchRPM, CONFIG.pitchPositiveRPMReversed)
     lastYawError, lastPitchError = yawDegrees, pitchDegrees
 
-    send({ kind="aim_rpm", yawRPM=yawRPM, pitchRPM=pitchRPM })
-    draw(yawInput, pitchInput, yawDegrees, pitchDegrees, yawRPM, pitchRPM)
+    send({ kind="aim_rpm", yawRPM=yawRPM, pitchRPM=pitchRPM,
+      steering=steeringInput })
+    draw(yawInput, pitchInput, steeringInput, yawDegrees, pitchDegrees, yawRPM, pitchRPM)
     sleep(CONFIG.loopSeconds)
   end
 end
