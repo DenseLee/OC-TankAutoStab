@@ -42,12 +42,14 @@ local CONFIG = {
   fullSpeedAtDegrees = 45,
   deadzoneDegrees = 0.2,
   proportionalGain = 1,
-  -- PD smoothing. The rate is measured from a short error history, then
-  -- filtered before damping is applied. Higher derivative gain brakes a
-  -- faster-closing error more strongly, but too high can feel sluggish.
-  derivativeGainRPMPerDegreePerSecond = 0.35,
-  errorHistoryTicks = 4,
-  errorRateFilterSeconds = 0.10,
+  -- Hybrid velocity damping. CC:VS reports omega in radians per second.
+  -- 60/(2*pi) is the 1:1 rad/s-to-RPM conversion from the simple controller
+  -- example. Change each scale for your actual shaft-to-turret gearing.
+  yawOmegaToRPM = 60 / (2 * math.pi),
+  pitchOmegaToRPM = 60 / (2 * math.pi),
+  omegaLookAheadSeconds = 0.10,
+  yawOmegaSign = 1,
+  pitchOmegaSign = 1,
   -- Largest command change each second. This is a command smoother, not a
   -- mechanical speed limit: 1600 allows 80 RPM change per game tick.
   maxRPMChangePerSecond = 1600,
@@ -98,6 +100,22 @@ local function axisAngle(x, y, z, angle)
   local half = angle / 2
   local sine = math.sin(half)
   return { x=x*sine, y=y*sine, z=z*sine, w=math.cos(half) }
+end
+
+local function rotateVector(q, vector)
+  local rotated = multiply(multiply(q, { x=vector.x, y=vector.y, z=vector.z, w=0 }), inverse(q))
+  return { x=rotated.x, y=rotated.y, z=rotated.z }
+end
+
+local function dot(a, b) return a.x*b.x + a.y*b.y + a.z*b.z end
+
+local function asVector(value, methodName)
+  assert(type(value) == "table", methodName .. "() did not return a table")
+  local x, y, z = value.x or value[1], value.y or value[2], value.z or value[3]
+  if value.v then x, y, z = value.v.x or value.v[1], value.v.y or value.v[2], value.v.z or value.v[3] end
+  assert(type(x) == "number" and type(y) == "number" and type(z) == "number",
+    "Unknown vector format from " .. methodName .. "()")
+  return { x=x, y=y, z=z }
 end
 
 local function asQuaternion(value)
@@ -153,26 +171,22 @@ local function approach(current, target, maximumChange)
 end
 
 local function newAxisState()
-  return { errors = {}, filteredRate = 0, commandRPM = 0 }
+  return { lastOmega = 0, commandRPM = 0 }
 end
 
-local function rpmForError(errorRadians, state, maximumRPM, reversed, feedforwardRPM)
+local function rpmForError(errorRadians, state, maximumRPM, reversed, feedforwardRPM,
+  angularVelocity, omegaToRPM)
   local errorDegrees = degrees(errorRadians)
-  local errors = state.errors
-  table.insert(errors, errorDegrees)
-  if #errors > CONFIG.errorHistoryTicks + 1 then table.remove(errors, 1) end
-
-  local oldestError = errors[1]
-  local elapsed = math.max((#errors - 1) * CONFIG.loopSeconds, CONFIG.loopSeconds)
-  local rawRate = (errorDegrees - oldestError) / elapsed
-  local alpha = CONFIG.loopSeconds / (CONFIG.errorRateFilterSeconds + CONFIG.loopSeconds)
-  state.filteredRate = state.filteredRate + alpha * (rawRate - state.filteredRate)
+  local angularAcceleration = (angularVelocity - state.lastOmega) / CONFIG.loopSeconds
+  state.lastOmega = angularVelocity
 
   local proportionalRPM = CONFIG.proportionalGain * errorDegrees
     / CONFIG.fullSpeedAtDegrees * maximumRPM
-  local derivativeRPM = state.filteredRate
-    * CONFIG.derivativeGainRPMPerDegreePerSecond
-  local feedbackRPM = proportionalRPM + derivativeRPM
+  -- Predict short-term continued motion, then oppose both current angular
+  -- velocity and its acceleration. This replaces the old error-history D.
+  local motionRPM = -(angularVelocity
+    + angularAcceleration * CONFIG.omegaLookAheadSeconds) * omegaToRPM
+  local feedbackRPM = proportionalRPM + motionRPM
   if math.abs(errorDegrees) <= CONFIG.deadzoneDegrees then feedbackRPM = 0 end
   -- The derivative term may reduce a closing correction to zero, but do not
   -- command the opposite direction before the turret has actually crossed
@@ -205,7 +219,7 @@ local function send(command)
 end
 
 local function draw(yawInput, pitchInput, steeringInput, yawFeedforward, pitchFeedforward,
-  yawError, pitchError, yawRPM, pitchRPM)
+  yawError, pitchError, yawOmega, pitchOmega, yawRPM, pitchRPM)
   if not CONFIG.showDebug then return end
   term.setCursorPos(1, 1)
   term.clear()
@@ -217,6 +231,7 @@ local function draw(yawInput, pitchInput, steeringInput, yawFeedforward, pitchFe
   print(string.format("Aim FF RPM:    %+.0f / %+.0f", yawFeedforward, pitchFeedforward))
   print(string.format("Yaw error:     %+.2f deg", yawError))
   print(string.format("Pitch error:   %+.2f deg", pitchError))
+  print(string.format("Omega Y/P:     %+.2f / %+.2f rad/s", yawOmega, pitchOmega))
   print(string.format("Yaw RPM:       %+d", yawRPM))
   print(string.format("Pitch RPM:     %+d", pitchRPM))
 end
@@ -247,17 +262,25 @@ local function run()
 
     local current = normalize(asQuaternion(ship.getQuaternion()))
     local yawError, pitchError = getYawPitchError(target, current)
+    local omega = asVector(ship.getOmega(), "ship.getOmega")
+    -- Yaw is around world Y. Pitch is around the turret's current local X
+    -- axis, rotated into world space before projecting omega onto it.
+    local yawOmega = omega.y * CONFIG.yawOmegaSign
+    local pitchOmega = dot(omega, rotateVector(current, { x=1, y=0, z=0 }))
+      * CONFIG.pitchOmegaSign
     local yawFeedforward = yawInput * CONFIG.manualAimMaxYawRPM
     local pitchFeedforward = pitchInput * CONFIG.manualAimMaxPitchRPM
     local yawRPM, yawDegrees = rpmForError(yawError, yawAxis,
-      CONFIG.maxYawRPM, CONFIG.yawPositiveRPMReversed, yawFeedforward)
+      CONFIG.maxYawRPM, CONFIG.yawPositiveRPMReversed, yawFeedforward,
+      yawOmega, CONFIG.yawOmegaToRPM)
     local pitchRPM, pitchDegrees = rpmForError(pitchError, pitchAxis,
-      CONFIG.maxPitchRPM, CONFIG.pitchPositiveRPMReversed, pitchFeedforward)
+      CONFIG.maxPitchRPM, CONFIG.pitchPositiveRPMReversed, pitchFeedforward,
+      pitchOmega, CONFIG.pitchOmegaToRPM)
 
     send({ kind="aim_rpm", yawRPM=yawRPM, pitchRPM=pitchRPM,
       steering=steeringInput })
     draw(yawInput, pitchInput, steeringInput, yawFeedforward, pitchFeedforward,
-      yawDegrees, pitchDegrees, yawRPM, pitchRPM)
+      yawDegrees, pitchDegrees, yawOmega, pitchOmega, yawRPM, pitchRPM)
     sleep(CONFIG.loopSeconds)
   end
 end
