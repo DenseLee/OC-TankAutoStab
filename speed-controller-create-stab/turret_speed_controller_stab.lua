@@ -7,8 +7,8 @@
 -- Relay wiring (faces are relative to the relay blocks):
 --   horizontal/yaw relay: top = aim right (+X), bottom = aim left (-X)
 --   vertical/pitch relay: top = aim up (+Y), bottom = aim down (-Y)
---   horizontal/yaw relay: front = steering right (+X)
---   vertical/pitch relay: front = steering left (-X)
+--   steering relay (redstone_relay_5): top = steering right (+X),
+--                                      bottom = steering left (-X)
 --
 -- The turret computer owns the target because it is on the turret ship and
 -- can therefore read that ship's quaternion. It sends signed RPM commands to
@@ -29,8 +29,9 @@ local CONFIG = {
   yawNegativeSide = "bottom",
   pitchPositiveSide = "top",
   pitchNegativeSide = "bottom",
-  steeringPositiveSide = "front",
-  steeringNegativeSide = "front",
+  steeringRelayName = "redstone_relay_5",
+  steeringPositiveSide = "top",
+  steeringNegativeSide = "bottom",
 
   -- Maximum signed RPM sent to the hull controllers.
   maxYawRPM = 256,
@@ -174,16 +175,15 @@ local function run()
   rednet.open(CONFIG.wirelessModemSide)
   local yawRelay = getRelay(CONFIG.yawRelayName, "yawRelayName")
   local pitchRelay = getRelay(CONFIG.pitchRelayName, "pitchRelayName")
+  local steeringRelay = getRelay(CONFIG.steeringRelayName, "steeringRelayName")
   local target = normalize(asQuaternion(ship.getQuaternion()))
   local lastYawError, lastPitchError = 0, 0
 
   while true do
     local rawYaw = signedInput(yawRelay, CONFIG.yawPositiveSide, CONFIG.yawNegativeSide)
     local rawPitch = signedInput(pitchRelay, CONFIG.pitchPositiveSide, CONFIG.pitchNegativeSide)
-    -- Steering sides live on separate relays, so read and combine them here.
-    local steeringPositive = yawRelay.getAnalogInput(CONFIG.steeringPositiveSide)
-    local steeringNegative = pitchRelay.getAnalogInput(CONFIG.steeringNegativeSide)
-    local rawSteering = clamp((steeringPositive - steeringNegative) / 15, -1, 1)
+    local rawSteering = signedInput(steeringRelay,
+      CONFIG.steeringPositiveSide, CONFIG.steeringNegativeSide)
     local yawInput = applyInputCurve(rawYaw, CONFIG.invertHorizontalAim)
     local pitchInput = applyInputCurve(rawPitch, CONFIG.invertVerticalAim)
     local steeringInput = applyInputCurve(rawSteering, false)

@@ -38,6 +38,6 @@ It subtracts reverse from forward and commands a signed target speed from `-256`
 
 ## Turret stabilization over wireless
 
-Run `turret_speed_controller_stab.lua` on the turret computer. Its front wireless modem sends signed yaw/pitch RPM commands to the hull computer's bottom wireless modem. Set the exact two relay names in the turret script after running `peripheral_check.lua` there. The horizontal relay's top/bottom faces provide aim X+/X-; the vertical relay's top/bottom faces provide aim Y+/Y-. The horizontal relay front is steering X+ and the vertical relay front is steering X-.
+Run `turret_speed_controller_stab.lua` on the turret computer. Its front wireless modem sends signed yaw/pitch RPM commands to the hull computer's bottom wireless modem. Set the exact two aim-relay names in the turret script after running `peripheral_check.lua` there. The horizontal relay's top/bottom faces provide aim X+/X-; the vertical relay's top/bottom faces provide aim Y+/Y-. Steering uses the dedicated `redstone_relay_5`: top is steering X+ and bottom is steering X-.
 
 Run `computer_assisted_driving.lua` on the hull computer. It now controls all three direct-attached Speed Controllers: back for transmission, left for turret yaw, and right for gun elevation. It stops yaw and elevation within four ticks if the turret radio messages cease. With no throttle, received steering input commands the positive `pivotTurnRPM`; the direct external gearshifts choose the turn direction.
