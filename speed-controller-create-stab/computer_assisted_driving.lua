@@ -15,8 +15,9 @@ local CONFIG = {
   reverseInputSide = "top",
 
   maxDriveRPM = 256,
-  -- Time taken from 0 to full speed is maxDriveRPM / this value.
-  -- 128 means approximately two seconds from 0 to 256 RPM.
+  -- Used only while an input is held. Time from 0 to full speed is
+  -- maxDriveRPM / this value; 128 is about two seconds to 256 RPM.
+  -- Releasing both directions always commands 0 RPM immediately.
   accelerationRPMPerSecond = 128,
   inputDeadzone = 0.03,
   inputCurveExponent = 1.5,
@@ -95,8 +96,16 @@ local function run()
     local rawInput = clamp((forward - reverse) / 15, -1, 1)
     local driveInput = curveInput(rawInput)
     local targetRPM = driveInput * CONFIG.maxDriveRPM
-    local maximumChange = CONFIG.accelerationRPMPerSecond * CONFIG.loopSeconds
-    local nextRPM = approach(commandedRPM, targetRPM, maximumChange)
+    local nextRPM
+    if driveInput == 0 then
+      -- Do not let the acceleration ramp leave a stale movement command after
+      -- the player releases the stick. This also prevents turn-only inputs
+      -- from causing a short forward creep.
+      nextRPM = 0
+    else
+      local maximumChange = CONFIG.accelerationRPMPerSecond * CONFIG.loopSeconds
+      nextRPM = approach(commandedRPM, targetRPM, maximumChange)
+    end
 
     setRPM(nextRPM)
     draw(forward, reverse, driveInput, targetRPM)
