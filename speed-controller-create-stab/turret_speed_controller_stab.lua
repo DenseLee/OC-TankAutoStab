@@ -50,15 +50,15 @@ local CONFIG = {
   rateFeedbackGain = 0.20,
 
   -- Learned plant response, in turret degrees/second per controller RPM.
-  -- 0.0055 is the initial estimate from 0.07 degrees/tick at 256 RPM.
+  -- 3.3 is the measured initial estimate for the current turret setup.
   -- The estimate adapts only during steady manual movement.
-  initialYawDegreesPerSecondPerRPM = 0.0055,
-  initialPitchDegreesPerSecondPerRPM = 0.0055,
+  initialYawDegreesPerSecondPerRPM = 3.3,
+  initialPitchDegreesPerSecondPerRPM = 3.3,
   plantLearningRate = 0.02,
   plantLearningMinimumRPM = 30,
   plantLearningMaximumAccelerationDegrees = 3,
   minimumPlantGain = 0.0005,
-  maximumPlantGain = 0.10,
+  maximumPlantGain = 10,
   yawOmegaSign = 1,
   pitchOmegaSign = 1,
   -- Largest command change each second. This is a command smoother, not a
@@ -71,8 +71,12 @@ local CONFIG = {
   -- The PD correction remains active to hold the world-space target.
   manualAimMaxYawRPM = 40,
   manualAimMaxPitchRPM = 40,
+  -- Keep a held stick's requested RPM direct and predictable. The adaptive
+  -- rate loop resumes as soon as that axis is released.
+  manualAimBypassesRateFeedback = true,
   aimInputDeadzone = 0.05,
-  aimInputCurveExponent = 1.5,
+  -- Higher exponent makes small analogue inputs much slower and more precise.
+  aimInputCurveExponent = 2.5,
   invertHorizontalAim = true,
   invertVerticalAim = true,
   -- On releasing both aim axes, hold the actual turret orientation instead
@@ -218,6 +222,11 @@ local function rpmForError(errorRadians, state, maximumRPM, reversed, feedforwar
     -- Bypass rate braking for this test. With the configured RPM slew this
     -- reaches 0 in one tick at the current 40 RPM output limit.
     desiredRPM = 0
+  elseif CONFIG.manualAimBypassesRateFeedback and feedforwardRPM ~= 0 then
+    -- Do not let a noisy/incorrect omega estimate slow a held manual input.
+    -- Target re-capture on release still returns control to stabilization.
+    desiredRPM = feedforwardRPM
+    desiredRate = feedforwardRPM * state.plantGain
   else
     local positionRate = 0
     if math.abs(errorDegrees) > CONFIG.deadzoneDegrees then
