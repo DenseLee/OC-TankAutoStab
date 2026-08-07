@@ -40,6 +40,9 @@ local CONFIG = {
   pitchPositiveRPMReversed = false,
 
   deadzoneDegrees = 0.2,
+  -- Temporary settling test: immediately command 0 RPM after manual input
+  -- is released and the axis is inside the deadzone.
+  hardStopInsideDeadzone = true,
   -- Outer loop: the desired angular speed is error / response time.
   -- Smaller values correct faster; output still cannot exceed max axis RPM.
   targetResponseSeconds = 1.0,
@@ -207,16 +210,26 @@ local function rpmForError(errorRadians, state, maximumRPM, reversed, feedforwar
   -- Desired rate comes from position error, plus direct manual aim rate.
   -- The measured rate closes the inner loop without requiring an error
   -- history or a fixed degrees-to-RPM proportional scale.
-  local positionRate = 0
-  if math.abs(errorDegrees) > CONFIG.deadzoneDegrees then
-    positionRate = errorDegrees / CONFIG.targetResponseSeconds
+  local hardStop = CONFIG.hardStopInsideDeadzone and feedforwardRPM == 0
+    and math.abs(errorDegrees) <= CONFIG.deadzoneDegrees
+  local desiredRPM
+  local desiredRate = 0
+  if hardStop then
+    -- Bypass rate braking for this test. With the configured RPM slew this
+    -- reaches 0 in one tick at the current 40 RPM output limit.
+    desiredRPM = 0
+  else
+    local positionRate = 0
+    if math.abs(errorDegrees) > CONFIG.deadzoneDegrees then
+      positionRate = errorDegrees / CONFIG.targetResponseSeconds
+    end
+    desiredRate = feedforwardRPM * state.plantGain + positionRate
+    local maximumRate = maximumRPM * state.plantGain
+    desiredRate = clamp(desiredRate, -maximumRate, maximumRate)
+    local rateError = desiredRate - angularVelocityDegrees
+    desiredRPM = desiredRate / state.plantGain
+      + CONFIG.rateFeedbackGain * rateError / state.plantGain
   end
-  local desiredRate = feedforwardRPM * state.plantGain + positionRate
-  local maximumRate = maximumRPM * state.plantGain
-  desiredRate = clamp(desiredRate, -maximumRate, maximumRate)
-  local rateError = desiredRate - angularVelocityDegrees
-  local desiredRPM = desiredRate / state.plantGain
-    + CONFIG.rateFeedbackGain * rateError / state.plantGain
   local rpm = clamp(desiredRPM,
     -maximumRPM, maximumRPM)
   if reversed then rpm = -rpm end
