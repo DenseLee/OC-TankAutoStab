@@ -42,7 +42,15 @@ local CONFIG = {
   fullSpeedAtDegrees = 45,
   deadzoneDegrees = 0.2,
   proportionalGain = 1,
-  derivativeGainSeconds = 0.0005,
+  -- PD smoothing. The rate is measured from a short error history, then
+  -- filtered before damping is applied. Higher derivative gain brakes a
+  -- faster-closing error more strongly, but too high can feel sluggish.
+  derivativeGainRPMPerDegreePerSecond = 0.35,
+  errorHistoryTicks = 4,
+  errorRateFilterSeconds = 0.10,
+  -- Largest command change each second. This is a command smoother, not a
+  -- mechanical speed limit: 1600 allows 80 RPM change per game tick.
+  maxRPMChangePerSecond = 1600,
 
   aimDegreesPerSecond = 36,
   aimInputDeadzone = 0.05,
@@ -134,16 +142,46 @@ local function applyInputCurve(value, inverted)
   return value < 0 and -magnitude or magnitude
 end
 
-local function rpmForError(errorRadians, previousError, maximumRPM, reversed)
-  local errorDegrees = degrees(errorRadians)
-  if math.abs(errorDegrees) <= CONFIG.deadzoneDegrees then return 0, errorDegrees end
+local function approach(current, target, maximumChange)
+  if target > current then return math.min(current + maximumChange, target) end
+  return math.max(current - maximumChange, target)
+end
 
-  local rateDegrees = (errorDegrees - previousError) / CONFIG.loopSeconds
-  local correction = CONFIG.proportionalGain * errorDegrees
-    + CONFIG.derivativeGainSeconds * rateDegrees
-  local rpm = clamp(correction / CONFIG.fullSpeedAtDegrees * maximumRPM,
+local function newAxisState()
+  return { errors = {}, filteredRate = 0, commandRPM = 0 }
+end
+
+local function rpmForError(errorRadians, state, maximumRPM, reversed)
+  local errorDegrees = degrees(errorRadians)
+  local errors = state.errors
+  table.insert(errors, errorDegrees)
+  if #errors > CONFIG.errorHistoryTicks + 1 then table.remove(errors, 1) end
+
+  local oldestError = errors[1]
+  local elapsed = math.max((#errors - 1) * CONFIG.loopSeconds, CONFIG.loopSeconds)
+  local rawRate = (errorDegrees - oldestError) / elapsed
+  local alpha = CONFIG.loopSeconds / (CONFIG.errorRateFilterSeconds + CONFIG.loopSeconds)
+  state.filteredRate = state.filteredRate + alpha * (rawRate - state.filteredRate)
+
+  local proportionalRPM = CONFIG.proportionalGain * errorDegrees
+    / CONFIG.fullSpeedAtDegrees * maximumRPM
+  local derivativeRPM = state.filteredRate
+    * CONFIG.derivativeGainRPMPerDegreePerSecond
+  local desiredRPM = proportionalRPM + derivativeRPM
+  if math.abs(errorDegrees) <= CONFIG.deadzoneDegrees then desiredRPM = 0 end
+  -- The derivative term may reduce a closing correction to zero, but do not
+  -- command the opposite direction before the turret has actually crossed
+  -- the target. This prevents derivative noise from creating a tiny reversal.
+  if errorDegrees > CONFIG.deadzoneDegrees then desiredRPM = math.max(0, desiredRPM) end
+  if errorDegrees < -CONFIG.deadzoneDegrees then desiredRPM = math.min(0, desiredRPM) end
+  local rpm = clamp(desiredRPM,
     -maximumRPM, maximumRPM)
   if reversed then rpm = -rpm end
+  state.commandRPM = approach(state.commandRPM, rpm,
+    CONFIG.maxRPMChangePerSecond * CONFIG.loopSeconds)
+  -- A stopped target should not retain a fractional-RPM command forever.
+  if desiredRPM == 0 and math.abs(state.commandRPM) < 0.5 then state.commandRPM = 0 end
+  rpm = state.commandRPM
   if rpm < 0 then rpm = math.ceil(rpm - 0.5) else rpm = math.floor(rpm + 0.5) end
   return rpm, errorDegrees
 end
@@ -177,7 +215,8 @@ local function run()
   local pitchRelay = getRelay(CONFIG.pitchRelayName, "pitchRelayName")
   local steeringRelay = getRelay(CONFIG.steeringRelayName, "steeringRelayName")
   local target = normalize(asQuaternion(ship.getQuaternion()))
-  local lastYawError, lastPitchError = 0, 0
+  local yawAxis = newAxisState()
+  local pitchAxis = newAxisState()
 
   while true do
     local rawYaw = signedInput(yawRelay, CONFIG.yawPositiveSide, CONFIG.yawNegativeSide)
@@ -196,11 +235,10 @@ local function run()
 
     local current = normalize(asQuaternion(ship.getQuaternion()))
     local yawError, pitchError = getYawPitchError(target, current)
-    local yawRPM, yawDegrees = rpmForError(yawError, lastYawError,
+    local yawRPM, yawDegrees = rpmForError(yawError, yawAxis,
       CONFIG.maxYawRPM, CONFIG.yawPositiveRPMReversed)
-    local pitchRPM, pitchDegrees = rpmForError(pitchError, lastPitchError,
+    local pitchRPM, pitchDegrees = rpmForError(pitchError, pitchAxis,
       CONFIG.maxPitchRPM, CONFIG.pitchPositiveRPMReversed)
-    lastYawError, lastPitchError = yawDegrees, pitchDegrees
 
     send({ kind="aim_rpm", yawRPM=yawRPM, pitchRPM=pitchRPM,
       steering=steeringInput })
