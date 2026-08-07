@@ -25,3 +25,13 @@ It commands one selected speed controller through a smooth linear sweep:
 Positive versus negative physical rotation depends on the shaft arrangement. Set `maxRPM` below `256` in `speed_controller_sweep.lua` if the first test should be gentler. `Ctrl+T` and any runtime error command `0 RPM` before the program exits.
 
 If more than one speed controller is connected, set `CONFIG.peripheralName` in the sweep script to the exact peripheral name printed by the check script.
+
+## Computer-assisted driving
+
+`computer_assisted_driving.lua` is for the hull computer's back-mounted transmission Speed Controller. It reads the Tweaked Controller's left-stick Y outputs:
+
+- computer front: forward (`+Y`);
+- computer top: reverse (`-Y`), through the independently mounted gearbox;
+- computer back: transmission Create Rotation Speed Controller.
+
+It subtracts reverse from forward and commands a signed target speed from `-256` to `+256 RPM`. The `inputCurveExponent` setting gives low stick inputs more precise, slower movement while keeping full stick at full configured speed. Run `Ctrl+T` to stop safely.
