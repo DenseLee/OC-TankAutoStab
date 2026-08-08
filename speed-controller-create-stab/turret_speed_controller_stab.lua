@@ -65,21 +65,20 @@ local CONFIG = {
   -- mechanical speed limit: 1600 allows 80 RPM change per game tick.
   maxRPMChangePerSecond = 1600,
 
-  aimDegreesPerSecond = 36,
-  -- Direct RPM contribution while the player is aiming. Tune these so a full
-  -- stick roughly matches aimDegreesPerSecond through your turret gearing.
-  -- The PD correction remains active to hold the world-space target.
+  -- Direct mouse/stick rate command. A full analogue input sends this RPM
+  -- immediately (subject only to maxRPMChangePerSecond). Small inputs pass
+  -- through aimInputCurveExponent for precise low-speed aiming.
   manualAimMaxYawRPM = 40,
   manualAimMaxPitchRPM = 40,
-  -- The default aim mode moves a virtual target smoothly and lets the
-  -- stabilizer track it. Keep direct feed-forward disabled for precise aim.
-  manualAimUsesFeedforward = false,
-  aimTargetResponseSeconds = 0.20,
+  -- True makes the stick directly command controller RPM. The hold target is
+  -- advanced by the same estimated angular rate, so position correction only
+  -- has to remove disturbances such as hull rotation.
+  manualAimUsesFeedforward = true,
   -- Keep a held stick's requested RPM direct and predictable. The adaptive
   -- rate loop resumes as soon as that axis is released.
   manualAimBypassesRateFeedback = true,
-  -- Keep position correction active while aiming. Set false to immediately
-  -- return to the earlier direct-manual-only behavior.
+  -- Keep position correction active while aiming. It is a separate
+  -- stabilization correction added to the direct manual RPM command.
   blendManualAimWithStabilization = true,
   aimInputDeadzone = 0.05,
   -- Higher exponent makes small analogue inputs much slower and more precise.
@@ -319,7 +318,6 @@ local function run()
   local pitchRelay = getRelay(CONFIG.pitchRelayName, "pitchRelayName")
   local steeringRelay = getRelay(CONFIG.steeringRelayName, "steeringRelayName")
   local aimTarget = normalize(asQuaternion(ship.getQuaternion()))
-  local stabilizedTarget = aimTarget
   local yawAxis = newAxisState(CONFIG.initialYawDegreesPerSecondPerRPM)
   local pitchAxis = newAxisState(CONFIG.initialPitchDegreesPerSecondPerRPM)
   local wasAiming = false
@@ -335,37 +333,37 @@ local function run()
     local current = normalize(asQuaternion(ship.getQuaternion()))
     local isAiming = yawInput ~= 0 or pitchInput ~= 0
 
-    if isAiming then
-      local amount = math.rad(CONFIG.aimDegreesPerSecond * CONFIG.loopSeconds)
-      aimTarget = normalize(multiply(axisAngle(0, 1, 0, yawInput * amount),
-        multiply(aimTarget, axisAngle(1, 0, 0, pitchInput * amount))))
-    elseif wasAiming and CONFIG.captureTargetOnAimRelease then
-      -- Feed-forward can move the physical turret faster than the virtual
-      -- target. Re-anchor at release so it holds this exact orientation.
-      aimTarget = current
-      stabilizedTarget = current
-    end
-    wasAiming = isAiming
-
-    -- Aim intent changes the final target slowly; hull stabilization always
-    -- tracks that final target with its separate, faster response setting.
-    local aimAlpha = CONFIG.loopSeconds
-      / (CONFIG.aimTargetResponseSeconds + CONFIG.loopSeconds)
-    stabilizedTarget = slerp(stabilizedTarget, aimTarget, aimAlpha)
-
-    local yawError, pitchError = getYawPitchError(stabilizedTarget, current)
-    local omega = asVector(ship.getOmega(), "ship.getOmega")
-    -- Yaw is around world Y. Pitch is around the turret's current local X
-    -- axis, rotated into world space before projecting omega onto it.
-    local yawOmega = omega.y * CONFIG.yawOmegaSign
-    local pitchOmega = dot(omega, rotateVector(current, { x=1, y=0, z=0 }))
-      * CONFIG.pitchOmegaSign
     local yawFeedforward = 0
     local pitchFeedforward = 0
     if CONFIG.manualAimUsesFeedforward then
       yawFeedforward = yawInput * CONFIG.manualAimMaxYawRPM
       pitchFeedforward = pitchInput * CONFIG.manualAimMaxPitchRPM
     end
+
+    if isAiming then
+      -- The target moves at the plant-predicted rate of the direct RPM
+      -- command. This is not a smoothing delay: it simply tells the hold
+      -- loop where direct mouse aim intends to be on this tick.
+      local yawAmount = math.rad(yawFeedforward * yawAxis.plantGain
+        * CONFIG.loopSeconds)
+      local pitchAmount = math.rad(pitchFeedforward * pitchAxis.plantGain
+        * CONFIG.loopSeconds)
+      aimTarget = normalize(multiply(axisAngle(0, 1, 0, yawAmount),
+        multiply(aimTarget, axisAngle(1, 0, 0, pitchAmount))))
+    elseif wasAiming and CONFIG.captureTargetOnAimRelease then
+      -- Re-anchor at release so hold starts from the exact position at which
+      -- the player stopped aiming, without a rubber-band correction.
+      aimTarget = current
+    end
+    wasAiming = isAiming
+
+    local yawError, pitchError = getYawPitchError(aimTarget, current)
+    local omega = asVector(ship.getOmega(), "ship.getOmega")
+    -- Yaw is around world Y. Pitch is around the turret's current local X
+    -- axis, rotated into world space before projecting omega onto it.
+    local yawOmega = omega.y * CONFIG.yawOmegaSign
+    local pitchOmega = dot(omega, rotateVector(current, { x=1, y=0, z=0 }))
+      * CONFIG.pitchOmegaSign
     local yawRPM, yawDegrees, yawGain = rpmForError(yawError, yawAxis,
       CONFIG.maxYawRPM, CONFIG.yawPositiveRPMReversed, yawFeedforward,
       yawOmega, isAiming)
