@@ -23,13 +23,13 @@ local CONFIG = {
 
   -- Run peripheral_check.lua on the turret computer and put the exact two
   -- relay names here. They must be different.
-  yawRelayName = "redstone_relay_4",
-  pitchRelayName = "redstone_relay_2",
+  yawRelayName = "redstone_relay_1",
+  pitchRelayName = "redstone_relay_0",
   yawPositiveSide = "top",
   yawNegativeSide = "bottom",
   pitchPositiveSide = "top",
   pitchNegativeSide = "bottom",
-  steeringRelayName = "redstone_relay_5",
+  steeringRelayName = "redstone_relay_2",
   steeringPositiveSide = "top",
   steeringNegativeSide = "bottom",
 
@@ -43,9 +43,9 @@ local CONFIG = {
   -- Temporary settling test: immediately command 0 RPM after manual input
   -- is released and the axis is inside the deadzone.
   hardStopInsideDeadzone = true,
-  -- Outer loop: the desired angular speed is error / response time.
-  -- Smaller values correct faster; output still cannot exceed max axis RPM.
-  targetResponseSeconds = 1.0,
+  -- Stabilization correction speed. Smaller values correct hull disturbance
+  -- faster; output still cannot exceed max axis RPM.
+  stabilizerResponseSeconds = 0.15,
   -- Inner rate correction. It compares desired and measured turret rate.
   rateFeedbackGain = 0.20,
 
@@ -71,6 +71,10 @@ local CONFIG = {
   -- The PD correction remains active to hold the world-space target.
   manualAimMaxYawRPM = 40,
   manualAimMaxPitchRPM = 40,
+  -- The default aim mode moves a virtual target smoothly and lets the
+  -- stabilizer track it. Keep direct feed-forward disabled for precise aim.
+  manualAimUsesFeedforward = false,
+  aimTargetResponseSeconds = 0.20,
   -- Keep a held stick's requested RPM direct and predictable. The adaptive
   -- rate loop resumes as soon as that axis is released.
   manualAimBypassesRateFeedback = true,
@@ -108,6 +112,27 @@ local function normalize(q)
   local length = math.sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w)
   assert(length > 0, "Invalid zero-length quaternion")
   return { x=q.x/length, y=q.y/length, z=q.z/length, w=q.w/length }
+end
+
+local function slerp(a, b, fraction)
+  fraction = clamp(fraction, 0, 1)
+  local cosine = a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w
+  if cosine < 0 then
+    b = { x=-b.x, y=-b.y, z=-b.z, w=-b.w }
+    cosine = -cosine
+  end
+  if cosine > 0.9995 then
+    return normalize({
+      x=a.x + (b.x-a.x)*fraction, y=a.y + (b.y-a.y)*fraction,
+      z=a.z + (b.z-a.z)*fraction, w=a.w + (b.w-a.w)*fraction,
+    })
+  end
+  local angle = math.acos(clamp(cosine, -1, 1))
+  local sine = math.sin(angle)
+  local left = math.sin((1-fraction)*angle) / sine
+  local right = math.sin(fraction*angle) / sine
+  return { x=a.x*left+b.x*right, y=a.y*left+b.y*right,
+    z=a.z*left+b.z*right, w=a.w*left+b.w*right }
 end
 
 local function inverse(q)
@@ -217,7 +242,7 @@ local function rpmForError(errorRadians, state, maximumRPM, reversed, feedforwar
   -- Desired rate comes from position error, plus direct manual aim rate.
   -- The measured rate closes the inner loop without requiring an error
   -- history or a fixed degrees-to-RPM proportional scale.
-  local hardStop = CONFIG.hardStopInsideDeadzone and feedforwardRPM == 0
+  local hardStop = CONFIG.hardStopInsideDeadzone and not isManualAiming
     and math.abs(errorDegrees) <= CONFIG.deadzoneDegrees
   local desiredRPM
   local desiredRate = 0
@@ -233,7 +258,7 @@ local function rpmForError(errorRadians, state, maximumRPM, reversed, feedforwar
   else
     local positionRate = 0
     if math.abs(errorDegrees) > CONFIG.deadzoneDegrees then
-      positionRate = errorDegrees / CONFIG.targetResponseSeconds
+    positionRate = errorDegrees / CONFIG.stabilizerResponseSeconds
     end
     -- Add world-space hold correction to the requested manual rate. This
     -- means hull stabilization remains effective while the gunner is aiming.
@@ -290,7 +315,8 @@ local function run()
   local yawRelay = getRelay(CONFIG.yawRelayName, "yawRelayName")
   local pitchRelay = getRelay(CONFIG.pitchRelayName, "pitchRelayName")
   local steeringRelay = getRelay(CONFIG.steeringRelayName, "steeringRelayName")
-  local target = normalize(asQuaternion(ship.getQuaternion()))
+  local aimTarget = normalize(asQuaternion(ship.getQuaternion()))
+  local stabilizedTarget = aimTarget
   local yawAxis = newAxisState(CONFIG.initialYawDegreesPerSecondPerRPM)
   local pitchAxis = newAxisState(CONFIG.initialPitchDegreesPerSecondPerRPM)
   local wasAiming = false
@@ -308,24 +334,35 @@ local function run()
 
     if isAiming then
       local amount = math.rad(CONFIG.aimDegreesPerSecond * CONFIG.loopSeconds)
-      target = normalize(multiply(axisAngle(0, 1, 0, yawInput * amount),
-        multiply(target, axisAngle(1, 0, 0, pitchInput * amount))))
+      aimTarget = normalize(multiply(axisAngle(0, 1, 0, yawInput * amount),
+        multiply(aimTarget, axisAngle(1, 0, 0, pitchInput * amount))))
     elseif wasAiming and CONFIG.captureTargetOnAimRelease then
       -- Feed-forward can move the physical turret faster than the virtual
       -- target. Re-anchor at release so it holds this exact orientation.
-      target = current
+      aimTarget = current
+      stabilizedTarget = current
     end
     wasAiming = isAiming
 
-    local yawError, pitchError = getYawPitchError(target, current)
+    -- Aim intent changes the final target slowly; hull stabilization always
+    -- tracks that final target with its separate, faster response setting.
+    local aimAlpha = CONFIG.loopSeconds
+      / (CONFIG.aimTargetResponseSeconds + CONFIG.loopSeconds)
+    stabilizedTarget = slerp(stabilizedTarget, aimTarget, aimAlpha)
+
+    local yawError, pitchError = getYawPitchError(stabilizedTarget, current)
     local omega = asVector(ship.getOmega(), "ship.getOmega")
     -- Yaw is around world Y. Pitch is around the turret's current local X
     -- axis, rotated into world space before projecting omega onto it.
     local yawOmega = omega.y * CONFIG.yawOmegaSign
     local pitchOmega = dot(omega, rotateVector(current, { x=1, y=0, z=0 }))
       * CONFIG.pitchOmegaSign
-    local yawFeedforward = yawInput * CONFIG.manualAimMaxYawRPM
-    local pitchFeedforward = pitchInput * CONFIG.manualAimMaxPitchRPM
+    local yawFeedforward = 0
+    local pitchFeedforward = 0
+    if CONFIG.manualAimUsesFeedforward then
+      yawFeedforward = yawInput * CONFIG.manualAimMaxYawRPM
+      pitchFeedforward = pitchInput * CONFIG.manualAimMaxPitchRPM
+    end
     local yawRPM, yawDegrees, yawGain = rpmForError(yawError, yawAxis,
       CONFIG.maxYawRPM, CONFIG.yawPositiveRPMReversed, yawFeedforward,
       yawOmega, isAiming)
