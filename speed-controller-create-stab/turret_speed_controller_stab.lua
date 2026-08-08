@@ -266,7 +266,10 @@ local function rpmForError(errorRadians, state, maximumRPM, reversed, feedforwar
     local maximumRate = maximumRPM * state.plantGain
     desiredRate = clamp(desiredRate, -maximumRate, maximumRate)
     desiredRPM = desiredRate / state.plantGain
-    if not (CONFIG.manualAimBypassesRateFeedback and feedforwardRPM ~= 0) then
+    -- In smoothed-target mode feed-forward is intentionally zero, but the
+    -- player is still aiming. Do not re-enable noisy omega feedback merely
+    -- because manualAimUsesFeedforward is disabled.
+    if not (CONFIG.manualAimBypassesRateFeedback and isManualAiming) then
       local rateError = desiredRate - angularVelocityDegrees
       desiredRPM = desiredRPM + CONFIG.rateFeedbackGain * rateError / state.plantGain
     end
